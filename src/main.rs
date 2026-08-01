@@ -1,6 +1,7 @@
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -10,142 +11,94 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 struct Policy {
     command: String,
+    #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
     allowed_tools: Vec<String>,
+    #[serde(default)]
     denied_tools: Vec<String>,
+    #[serde(default)]
     require_approval: Vec<String>,
+    #[serde(default)]
     allowed_roots: Vec<String>,
+    #[serde(default)]
     redact_patterns: Vec<String>,
+    #[serde(default = "default_calls")]
     max_calls_per_minute: usize,
+    #[serde(default = "default_request_bytes")]
     max_request_bytes: usize,
+    #[serde(default = "default_argument_bytes")]
     max_argument_bytes: usize,
+    #[serde(default)]
     denied_argument_keys: Vec<String>,
+    #[serde(default)]
     denied_argument_values: Vec<String>,
+    #[serde(default = "default_approval_ttl")]
     approval_ttl_seconds: u64,
+    #[serde(default)]
     inventory_max_age_seconds: u64,
+    #[serde(default = "default_audit_path")]
     audit_path: PathBuf,
     inventory_path: Option<PathBuf>,
+    #[serde(default)]
     require_known_tools: bool,
+}
+
+fn default_calls() -> usize {
+    60
+}
+fn default_request_bytes() -> usize {
+    65_536
+}
+fn default_argument_bytes() -> usize {
+    32_768
+}
+fn default_approval_ttl() -> u64 {
+    300
+}
+fn default_audit_path() -> PathBuf {
+    PathBuf::from("mcpwall-audit.jsonl")
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    server: BTreeMap<String, Policy>,
 }
 
 fn usage() {
     println!(
-        "mcpwall 0.4.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 0.5.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
-}
-
-fn value_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{} =", key);
-    line.strip_prefix(&prefix).map(str::trim)
-}
-
-fn parse_string(raw: &str) -> Result<String, String> {
-    let s = raw.trim();
-    if s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
-        return Err(format!("expected quoted string: {s}"));
-    }
-    Ok(s[1..s.len() - 1]
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\"))
-}
-
-fn parse_array(raw: &str) -> Result<Vec<String>, String> {
-    let s = raw.trim();
-    if s == "[]" {
-        return Ok(Vec::new());
-    }
-    if !s.starts_with('[') || !s.ends_with(']') {
-        return Err(format!("expected string array: {s}"));
-    }
-    s[1..s.len() - 1].split(',').map(parse_string).collect()
 }
 
 fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let wanted = format!("[server.{server}]");
-    let mut active = false;
-    let mut p = Policy {
-        max_calls_per_minute: 60,
-        max_request_bytes: 65_536,
-        max_argument_bytes: 32_768,
-        approval_ttl_seconds: 300,
-        inventory_max_age_seconds: 0,
-        audit_path: PathBuf::from("mcpwall-audit.jsonl"),
-        ..Policy::default()
-    };
-    for raw in content.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            active = line == wanted;
-            continue;
-        }
-        if !active {
-            continue;
-        }
-        if let Some(v) = value_after(line, "command") {
-            p.command = parse_string(v)?;
-        } else if let Some(v) = value_after(line, "args") {
-            p.args = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "allowed_tools") {
-            p.allowed_tools = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "denied_tools") {
-            p.denied_tools = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "require_approval") {
-            p.require_approval = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "allowed_roots") {
-            p.allowed_roots = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "redact_patterns") {
-            p.redact_patterns = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "max_calls_per_minute") {
-            p.max_calls_per_minute = v
-                .parse()
-                .map_err(|_| format!("invalid max_calls_per_minute: {v}"))?;
-        } else if let Some(v) = value_after(line, "max_request_bytes") {
-            p.max_request_bytes = v
-                .parse()
-                .map_err(|_| format!("invalid max_request_bytes: {v}"))?;
-        } else if let Some(v) = value_after(line, "max_argument_bytes") {
-            p.max_argument_bytes = v
-                .parse()
-                .map_err(|_| format!("invalid max_argument_bytes: {v}"))?;
-        } else if let Some(v) = value_after(line, "denied_argument_keys") {
-            p.denied_argument_keys = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "denied_argument_values") {
-            p.denied_argument_values = parse_array(v)?;
-        } else if let Some(v) = value_after(line, "approval_ttl_seconds") {
-            p.approval_ttl_seconds = v
-                .parse()
-                .map_err(|_| format!("invalid approval_ttl_seconds: {v}"))?;
-        } else if let Some(v) = value_after(line, "inventory_max_age_seconds") {
-            p.inventory_max_age_seconds = v
-                .parse()
-                .map_err(|_| format!("invalid inventory_max_age_seconds: {v}"))?;
-        } else if let Some(v) = value_after(line, "inventory_path") {
-            p.inventory_path = Some(PathBuf::from(parse_string(v)?));
-        } else if let Some(v) = value_after(line, "require_known_tools") {
-            p.require_known_tools = v
-                .parse()
-                .map_err(|_| format!("invalid require_known_tools: {v}"))?;
-        } else if let Some(v) = value_after(line, "audit_path") {
-            p.audit_path = PathBuf::from(parse_string(v)?);
-        }
-    }
-    if !active {
-        return Err(format!("server section not found: {server}"));
-    }
-    if p.command.is_empty() {
+    let config: Config =
+        toml::from_str(&content).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let mut policy = config
+        .server
+        .get(server)
+        .cloned()
+        .ok_or_else(|| format!("server section not found: {server}"))?;
+    if policy.command.is_empty() {
         return Err("command is required".into());
     }
-    if p.max_calls_per_minute == 0 {
+    if policy.max_calls_per_minute == 0 {
         return Err("max_calls_per_minute must be greater than zero".into());
     }
-    Ok(p)
+    if policy.max_request_bytes == 0 {
+        return Err("max_request_bytes must be greater than zero".into());
+    }
+    if policy.max_argument_bytes == 0 {
+        return Err("max_argument_bytes must be greater than zero".into());
+    }
+    if policy.audit_path.as_os_str().is_empty() {
+        policy.audit_path = default_audit_path();
+    }
+    Ok(policy)
 }
 
 fn json_string_fields(line: &str) -> Vec<String> {
@@ -611,7 +564,7 @@ fn status(p: &Policy) -> Result<(), String> {
     for approval in approvals {
         *counts.entry(approval.state).or_insert(0usize) += 1;
     }
-    println!("version: 0.4.0");
+    println!("version: 0.5.0");
     println!("command: {}", p.command);
     println!("audit_exists: {}", p.audit_path.exists());
     println!(
@@ -879,8 +832,12 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
-    fn arrays_parse() {
-        assert_eq!(parse_array("[\"a\", \"b\"]").unwrap(), vec!["a", "b"]);
+    fn toml_config_parses_escaped_values() {
+        let config: Config = toml::from_str(
+            "[server.fixture]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf # safe\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.server["fixture"].args[1], "printf # safe");
     }
     #[test]
     fn fields_parse() {

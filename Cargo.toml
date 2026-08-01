@@ -1,6 +1,6 @@
 [package]
 name = "mcpwall"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A local-first policy firewall and audit proxy for MCP stdio servers"
 license = "MIT"
@@ -8,8 +8,10 @@ repository = "https://github.com/Hardonian/mcpwall"
 readme = "README.md"
 
 [dependencies]
-sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
 
 [profile.release]
 opt-level = "z"

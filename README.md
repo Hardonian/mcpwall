@@ -28,7 +28,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-The release binary is `target/release/mcpwall` (currently v0.4.0).
+The release binary is `target/release/mcpwall` (currently v0.5.0).
 
 ## Configure
 
@@ -111,6 +111,10 @@ Operational status:
 ```
 
 `status` reports audit size, approval state counts, inventory freshness, and active limits without starting the child server.
+
+## v0.5 configuration hardening
+
+The policy file is now parsed by the TOML library rather than the former line parser. Quoted `#` characters, escaped strings, inline arrays, and malformed TOML are handled by the parser. Unknown or malformed configuration is rejected before the child server starts.
 
 ## Security model and limitations
 
