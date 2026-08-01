@@ -23,6 +23,18 @@ mcpwall status --config "$HOME/.config/mcpwall/filesystem.toml" --server filesys
 
 Enable `require_known_tools = true` only after the inventory has been captured. Set `inventory_max_age_seconds` so a changed or stale server capability set fails closed.
 
+For high-risk tools, add a per-tool schema:
+
+```toml
+[server.filesystem.tool_policies.read_file]
+allowed_arguments = ["path"]
+required_arguments = ["path"]
+argument_types = { path = "string" }
+path_arguments = ["path"]
+```
+
+Schema enforcement runs before generic argument and path policy. The release manifest and `SHA256SUMS` must be distributed with the binary; the manifest is integrity metadata, not a signature.
+
 ## Runtime pattern
 
 Put mcpwall between the MCP client and child server. Keep the policy, audit file, approval queue, and inventory on a private local filesystem. Do not put audit output in a web-served directory.

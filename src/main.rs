@@ -45,6 +45,20 @@ struct Policy {
     inventory_path: Option<PathBuf>,
     #[serde(default)]
     require_known_tools: bool,
+    #[serde(default)]
+    tool_policies: BTreeMap<String, ToolPolicy>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct ToolPolicy {
+    #[serde(default)]
+    allowed_arguments: Vec<String>,
+    #[serde(default)]
+    required_arguments: Vec<String>,
+    #[serde(default)]
+    argument_types: BTreeMap<String, String>,
+    #[serde(default)]
+    path_arguments: Vec<String>,
 }
 
 fn default_calls() -> usize {
@@ -70,7 +84,7 @@ struct Config {
 
 fn usage() {
     println!(
-        "mcpwall 0.5.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 0.6.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -558,13 +572,73 @@ fn argument_violation(value: &Value, p: &Policy) -> Option<String> {
     walk(args, p)
 }
 
+fn tool_schema_violation(request: &Value, tool: &str, p: &Policy) -> Option<String> {
+    let rule = p.tool_policies.get(tool)?;
+    let args = request
+        .pointer("/params/arguments")
+        .and_then(Value::as_object);
+    let Some(args) = args else {
+        return Some("tool arguments must be a JSON object".into());
+    };
+    for key in &rule.required_arguments {
+        if !args.contains_key(key) {
+            return Some(format!("required argument missing: {key}"));
+        }
+    }
+    if !rule.allowed_arguments.is_empty()
+        && args.keys().any(|key| !rule.allowed_arguments.contains(key))
+    {
+        let key = args
+            .keys()
+            .find(|key| !rule.allowed_arguments.contains(key))
+            .expect("argument key exists after any check");
+        return Some(format!("argument not allowed for {tool}: {key}"));
+    }
+    for (key, expected) in &rule.argument_types {
+        let Some(value) = args.get(key) else {
+            continue;
+        };
+        let valid = match expected.as_str() {
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "number" => value.is_number(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "null" => value.is_null(),
+            other => {
+                return Some(format!(
+                    "unsupported argument type in policy: {key}={other}"
+                ));
+            }
+        };
+        if !valid {
+            return Some(format!("argument type mismatch: {key} expected {expected}"));
+        }
+    }
+    for key in &rule.path_arguments {
+        let Some(value) = args.get(key).and_then(Value::as_str) else {
+            return Some(format!("path argument must be a string: {key}"));
+        };
+        if !p.allowed_roots.is_empty()
+            && !p
+                .allowed_roots
+                .iter()
+                .any(|root| value == root || value.starts_with(&(root.clone() + "/")))
+        {
+            return Some(format!("path argument denied: {key}"));
+        }
+    }
+    None
+}
+
 fn status(p: &Policy) -> Result<(), String> {
     let approvals = load_approvals(p);
     let mut counts = std::collections::BTreeMap::new();
     for approval in approvals {
         *counts.entry(approval.state).or_insert(0usize) += 1;
     }
-    println!("version: 0.5.0");
+    println!("version: 0.6.0");
     println!("command: {}", p.command);
     println!("audit_exists: {}", p.audit_path.exists());
     println!(
@@ -680,6 +754,17 @@ fn proxy(p: &Policy) -> Result<(), String> {
         }
         calls.push_back(ts);
         if let Some(t) = &tool {
+            if let Some(reason) = tool_schema_violation(&request, t, p) {
+                let out = error_response(&id, &reason);
+                println!("{out}");
+                audit(
+                    &p.audit_path,
+                    &format!(r#"{{"event":"deny","reason":"schema","tool":"{t}","id":{id}}}"#),
+                    &p.redact_patterns,
+                )
+                .map_err(|e| e.to_string())?;
+                continue;
+            }
             if let Some(reason) = argument_violation(&request, p) {
                 let out = error_response(&id, &reason);
                 println!("{out}");
@@ -875,6 +960,43 @@ mod tests {
         let value: Value =
             serde_json::from_str(r#"{"params":{"arguments":{"note":"PRIVATE"}}}"#).unwrap();
         assert!(argument_violation(&value, &p).is_some());
+    }
+    #[test]
+    fn tool_schema_enforces_required_allowed_type_and_path() {
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "read_file".into(),
+            ToolPolicy {
+                allowed_arguments: vec!["path".into()],
+                required_arguments: vec!["path".into()],
+                argument_types: BTreeMap::from([(String::from("path"), String::from("string"))]),
+                path_arguments: vec!["path".into()],
+            },
+        );
+        let p = Policy {
+            allowed_roots: vec!["/home/scott/projects".into()],
+            tool_policies: policies,
+            ..Policy::default()
+        };
+        let good: Value = serde_json::from_str(
+            r#"{"params":{"name":"read_file","arguments":{"path":"/home/scott/projects/a"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(tool_schema_violation(&good, "read_file", &p), None);
+        let bad_type: Value =
+            serde_json::from_str(r#"{"params":{"arguments":{"path":true}}}"#).unwrap();
+        assert!(
+            tool_schema_violation(&bad_type, "read_file", &p)
+                .unwrap()
+                .contains("type mismatch")
+        );
+        let bad_path: Value =
+            serde_json::from_str(r#"{"params":{"arguments":{"path":"/etc/passwd"}}}"#).unwrap();
+        assert!(
+            tool_schema_violation(&bad_path, "read_file", &p)
+                .unwrap()
+                .contains("path argument denied")
+        );
     }
     #[test]
     fn malformed_and_oversized_requests_fail_closed() {

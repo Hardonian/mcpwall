@@ -28,7 +28,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-The release binary is `target/release/mcpwall` (currently v0.5.0).
+The release binary is `target/release/mcpwall` (currently v0.6.0).
 
 ## Configure
 
@@ -115,6 +115,28 @@ Operational status:
 ## v0.5 configuration hardening
 
 The policy file is now parsed by the TOML library rather than the former line parser. Quoted `#` characters, escaped strings, inline arrays, and malformed TOML are handled by the parser. Unknown or malformed configuration is rejected before the child server starts.
+
+## v0.6 per-tool schemas and release provenance
+
+Per-tool policies can require and restrict argument fields, enforce JSON value types, and designate path arguments:
+
+```toml
+[server.filesystem.tool_policies.read_file]
+allowed_arguments = ["path"]
+required_arguments = ["path"]
+argument_types = { path = "string" }
+path_arguments = ["path"]
+```
+
+Schema violations are denied before the generic argument and path controls. Supported types are `string`, `boolean`, `number`, `integer`, `object`, `array`, and `null`.
+
+Tagged releases generate:
+
+- `RELEASE-MANIFEST.json` with name, version, target, asset, and SHA-256
+- `SHA256SUMS` covering the binary and manifest
+- A tarball containing the binary, manifest, and checksums
+
+The manifest is integrity metadata, not a cryptographic signature. GitHub Actions provenance/signing remains a separate trust-layer decision.
 
 ## Security model and limitations
 

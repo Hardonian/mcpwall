@@ -17,3 +17,9 @@ inventory_max_age_seconds = 86400
 inventory_path = "/tmp/mcpwall-filesystem.tools"
 require_known_tools = false
 audit_path = "/tmp/mcpwall-filesystem.jsonl"
+
+[server.filesystem.tool_policies.read_file]
+allowed_arguments = ["path"]
+required_arguments = ["path"]
+argument_types = { path = "string" }
+path_arguments = ["path"]
