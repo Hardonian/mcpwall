@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -16,12 +17,15 @@ struct Policy {
     allowed_roots: Vec<String>,
     redact_patterns: Vec<String>,
     max_calls_per_minute: usize,
+    approval_ttl_seconds: u64,
     audit_path: PathBuf,
+    inventory_path: Option<PathBuf>,
+    require_known_tools: bool,
 }
 
 fn usage() {
     println!(
-        "mcpwall 0.1.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME REQUEST_ID\n  mcpwall deny    --config FILE --server NAME REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout."
+        "mcpwall 0.3.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall inventory --config FILE --server NAME\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -57,6 +61,7 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
     let mut active = false;
     let mut p = Policy {
         max_calls_per_minute: 60,
+        approval_ttl_seconds: 300,
         audit_path: PathBuf::from("mcpwall-audit.jsonl"),
         ..Policy::default()
     };
@@ -90,6 +95,16 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
             p.max_calls_per_minute = v
                 .parse()
                 .map_err(|_| format!("invalid max_calls_per_minute: {v}"))?;
+        } else if let Some(v) = value_after(line, "approval_ttl_seconds") {
+            p.approval_ttl_seconds = v
+                .parse()
+                .map_err(|_| format!("invalid approval_ttl_seconds: {v}"))?;
+        } else if let Some(v) = value_after(line, "inventory_path") {
+            p.inventory_path = Some(PathBuf::from(parse_string(v)?));
+        } else if let Some(v) = value_after(line, "require_known_tools") {
+            p.require_known_tools = v
+                .parse()
+                .map_err(|_| format!("invalid require_known_tools: {v}"))?;
         } else if let Some(v) = value_after(line, "audit_path") {
             p.audit_path = PathBuf::from(parse_string(v)?);
         }
@@ -145,6 +160,27 @@ fn json_field(line: &str, field: &str) -> Option<String> {
     } else {
         Some(rest.split([',', '}']).next()?.trim().to_string())
     }
+}
+
+fn named_values(line: &str, field: &str) -> Vec<String> {
+    let needle = format!("\"{field}\"");
+    let mut values = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(&needle) {
+        let pos = from + rel;
+        let rest = line[pos + needle.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix(':').map(str::trim_start) else {
+            from = pos + needle.len();
+            continue;
+        };
+        let Some(end) = rest.strip_prefix('"').and_then(|x| x.find('"')) else {
+            from = pos + needle.len();
+            continue;
+        };
+        values.push(rest[1..=end].to_owned());
+        from = pos + needle.len();
+    }
+    values
 }
 
 fn tool_name(line: &str) -> Option<String> {
@@ -212,33 +248,265 @@ fn error_response(id: &str, message: &str) -> String {
     )
 }
 
-fn approved_path(p: &Policy) -> PathBuf {
-    PathBuf::from(format!("{}.approved", p.audit_path.display()))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Approval {
+    request_id: String,
+    request_hash: String,
+    tool: String,
+    state: String,
+    created_at: u64,
+    expires_at: u64,
 }
-fn is_approved(p: &Policy, id: &str) -> io::Result<bool> {
-    Ok(fs::read_to_string(approved_path(p))
+
+fn approval_path(p: &Policy) -> PathBuf {
+    PathBuf::from(format!("{}.approvals.tsv", p.audit_path.display()))
+}
+fn approval_lock_path(p: &Policy) -> PathBuf {
+    PathBuf::from(format!("{}.lock", approval_path(p).display()))
+}
+fn escape_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+}
+fn unescape_field(value: &str) -> String {
+    value
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\\", "\\")
+}
+fn serialize_approval(a: &Approval) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        escape_field(&a.request_id),
+        a.request_hash,
+        escape_field(&a.tool),
+        a.state,
+        a.created_at,
+        a.expires_at
+    )
+}
+fn parse_approval(line: &str) -> Option<Approval> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() != 6 {
+        return None;
+    }
+    Some(Approval {
+        request_id: unescape_field(fields[0]),
+        request_hash: fields[1].to_owned(),
+        tool: unescape_field(fields[2]),
+        state: fields[3].to_owned(),
+        created_at: fields[4].parse().ok()?,
+        expires_at: fields[5].parse().ok()?,
+    })
+}
+fn load_approvals(p: &Policy) -> Vec<Approval> {
+    fs::read_to_string(approval_path(p))
         .unwrap_or_default()
         .lines()
-        .any(|x| x.trim() == id))
+        .filter_map(parse_approval)
+        .collect()
 }
-fn set_approval(p: &Policy, id: &str, allow: bool) -> io::Result<()> {
-    let path = approved_path(p);
+fn save_approvals(p: &Policy, records: &[Approval]) -> io::Result<()> {
+    let path = approval_path(p);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut ids: Vec<String> = fs::read_to_string(&path)
+    let tmp = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
+    let body = records
+        .iter()
+        .map(serialize_approval)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        &tmp,
+        if body.is_empty() {
+            String::new()
+        } else {
+            body + "\n"
+        },
+    )?;
+    fs::rename(tmp, path)
+}
+struct QueueLock {
+    path: PathBuf,
+}
+impl Drop for QueueLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+fn acquire_queue_lock(p: &Policy) -> io::Result<QueueLock> {
+    let path = approval_lock_path(p);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for _ in 0..50 {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(QueueLock { path }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "approval queue is locked",
+    ))
+}
+fn request_hash(line: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(line.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+fn approval_status(p: &Policy, request_id: &str, hash: &str, now: u64) -> Result<bool, String> {
+    let mut records = load_approvals(p);
+    let mut changed = false;
+    let mut approved = false;
+    for record in &mut records {
+        if record.request_id == request_id && record.request_hash == hash {
+            if record.state == "approved" && record.expires_at > now {
+                record.state = "consumed".into();
+                approved = true;
+                changed = true;
+            } else if record.state == "approved" && record.expires_at <= now {
+                record.state = "expired".into();
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _lock = acquire_queue_lock(p).map_err(|e| e.to_string())?;
+        save_approvals(p, &records).map_err(|e| e.to_string())?;
+    }
+    Ok(approved)
+}
+fn enqueue_approval(
+    p: &Policy,
+    request_id: &str,
+    hash: &str,
+    tool: &str,
+    now: u64,
+) -> Result<(), String> {
+    let _lock = acquire_queue_lock(p).map_err(|e| e.to_string())?;
+    let mut records = load_approvals(p);
+    if !records
+        .iter()
+        .any(|x| x.request_id == request_id && x.request_hash == hash)
+    {
+        records.push(Approval {
+            request_id: request_id.into(),
+            request_hash: hash.into(),
+            tool: tool.into(),
+            state: "pending".into(),
+            created_at: now,
+            expires_at: now + p.approval_ttl_seconds,
+        });
+        save_approvals(p, &records).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+fn mutate_approval(
+    p: &Policy,
+    request_id: &str,
+    hash: &str,
+    state: &str,
+    ttl: u64,
+) -> Result<(), String> {
+    let _lock = acquire_queue_lock(p).map_err(|e| e.to_string())?;
+    let mut records = load_approvals(p);
+    let now = now();
+    let mut found = false;
+    for record in &mut records {
+        if record.request_id == request_id
+            && record.request_hash == hash
+            && record.state == "pending"
+        {
+            record.state = state.into();
+            record.expires_at = now + ttl;
+            found = true;
+        }
+    }
+    if !found {
+        return Err("no matching pending approval (request ID and hash must match)".into());
+    }
+    save_approvals(p, &records).map_err(|e| e.to_string())
+}
+fn list_approvals(p: &Policy) {
+    for record in load_approvals(p) {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            record.request_id,
+            record.request_hash,
+            record.tool,
+            record.state,
+            record.created_at,
+            record.expires_at
+        );
+    }
+}
+
+fn inventory_path(p: &Policy) -> PathBuf {
+    p.inventory_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("{}.tools", p.audit_path.display())))
+}
+fn inventory(p: &Policy) -> Result<(), String> {
+    let mut child = Command::new(&p.command)
+        .args(&p.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", p.command))?;
+    let mut input = child.stdin.take().ok_or("child stdin unavailable")?;
+    let output = child.stdout.take().ok_or("child stdout unavailable")?;
+    input
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n")
+        .map_err(|e| e.to_string())?;
+    input.flush().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(output);
+    let mut response = String::new();
+    reader.read_line(&mut response).map_err(|e| e.to_string())?;
+    if response.is_empty() {
+        return Err("child exited without tools/list response".into());
+    }
+    let mut names = named_values(&response, "name");
+    names.sort();
+    names.dedup();
+    let path = inventory_path(p);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
+    fs::write(
+        &tmp,
+        if names.is_empty() {
+            String::new()
+        } else {
+            names.join("\n") + "\n"
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    fs::rename(tmp, &path).map_err(|e| e.to_string())?;
+    let _ = child.kill();
+    println!("inventory: {} tools", names.len());
+    println!("path: {}", path.display());
+    for name in names {
+        println!("tool: {name}");
+    }
+    Ok(())
+}
+fn known_tool(p: &Policy, tool: &str) -> bool {
+    if !p.require_known_tools {
+        return true;
+    }
+    fs::read_to_string(inventory_path(p))
         .unwrap_or_default()
         .lines()
-        .map(str::to_owned)
-        .filter(|x| x != id)
-        .collect();
-    if allow {
-        ids.push(id.to_owned());
-    }
-    fs::write(
-        path,
-        ids.join("\n") + if ids.is_empty() { "" } else { "\n" },
-    )
+        .any(|x| x.trim() == tool)
 }
 
 fn doctor(p: &Policy) -> Result<(), String> {
@@ -259,6 +527,17 @@ fn doctor(p: &Policy) -> Result<(), String> {
         println!("tools: {} allowed", p.allowed_tools.len());
     }
     println!("approval rules: {}", p.require_approval.len());
+    println!("approval ttl: {}s", p.approval_ttl_seconds);
+    if p.require_known_tools {
+        let path = inventory_path(p);
+        if !path.exists() {
+            return Err(format!(
+                "tool inventory missing: {} (run inventory first)",
+                path.display()
+            ));
+        }
+        println!("inventory: {}", path.display());
+    }
     println!("audit: {}", p.audit_path.display());
     println!("status: healthy");
     Ok(())
@@ -291,6 +570,7 @@ fn proxy(p: &Policy) -> Result<(), String> {
             None
         };
         let id = request_id(&line);
+        let hash = request_hash(&line);
         let ts = now();
         while calls.front().is_some_and(|x| *x + 60 <= ts) {
             calls.pop_front();
@@ -310,8 +590,14 @@ fn proxy(p: &Policy) -> Result<(), String> {
         if let Some(t) = &tool {
             if p.denied_tools.iter().any(|x| x == t)
                 || (!p.allowed_tools.is_empty() && !p.allowed_tools.iter().any(|x| x == t))
+                || !known_tool(p, t)
             {
-                let out = error_response(&id, "tool denied by policy");
+                let reason = if !known_tool(p, t) {
+                    "tool not present in inventory"
+                } else {
+                    "tool denied by policy"
+                };
+                let out = error_response(&id, reason);
                 println!("{out}");
                 audit(
                     &p.audit_path,
@@ -347,15 +633,17 @@ fn proxy(p: &Policy) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
                 continue;
             }
-            if p.require_approval.iter().any(|x| x == t)
-                && !is_approved(p, &id).map_err(|e| e.to_string())?
-            {
-                let out = error_response(&id, &format!("approval required; request_id={id}"));
+            if p.require_approval.iter().any(|x| x == t) && !approval_status(p, &id, &hash, ts)? {
+                enqueue_approval(p, &id, &hash, t, ts)?;
+                let out = error_response(
+                    &id,
+                    &format!("approval required; request_id={id}; request_hash={hash}"),
+                );
                 println!("{out}");
                 audit(
                     &p.audit_path,
                     &format!(
-                        r#"{{"event":"approval_required","tool":"{t}","id":{id},"request":{line}}}"#
+                        r#"{{"event":"approval_required","tool":"{t}","id":{id},"request_hash":"{hash}","request":{line}}}"#
                     ),
                     &p.redact_patterns,
                 )
@@ -404,10 +692,27 @@ fn main() {
         match command.as_str() {
             "doctor" => doctor(&policy),
             "proxy" => proxy(&policy),
+            "inventory" => inventory(&policy),
+            "approvals" => {
+                list_approvals(&policy);
+                Ok(())
+            }
             "approve" | "deny" => {
                 let id = args.last().ok_or("missing request id")?;
-                set_approval(&policy, id, command == "approve").map_err(|e| e.to_string())?;
-                println!("{} {}", command, id);
+                let hash = arg_value(&args, "--hash")?;
+                let ttl = args
+                    .windows(2)
+                    .find(|w| w[0] == "--ttl")
+                    .map(|w| w[1].parse::<u64>().map_err(|_| "invalid --ttl"))
+                    .transpose()?
+                    .unwrap_or(policy.approval_ttl_seconds);
+                let state = if command == "approve" {
+                    "approved"
+                } else {
+                    "denied"
+                };
+                mutate_approval(&policy, id, &hash, state, ttl)?;
+                println!("{} {} {}", command, id, hash);
                 Ok(())
             }
             _ => Err(format!("unknown command: {command}")),
@@ -441,5 +746,27 @@ mod tests {
         );
         assert!(got.contains("***REDACTED***"));
         assert!(!got.contains("secret-value"));
+    }
+    #[test]
+    fn request_hash_is_sha256() {
+        assert_eq!(
+            request_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+    #[test]
+    fn approval_round_trip() {
+        let original = Approval {
+            request_id: "7".into(),
+            request_hash: "abc".into(),
+            tool: "delete_file".into(),
+            state: "pending".into(),
+            created_at: 10,
+            expires_at: 20,
+        };
+        assert_eq!(
+            parse_approval(&serialize_approval(&original)),
+            Some(original)
+        );
     }
 }

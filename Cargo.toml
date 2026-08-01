@@ -1,11 +1,14 @@
 [package]
 name = "mcpwall"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "A local-first policy firewall and audit proxy for MCP stdio servers"
 license = "MIT"
 repository = "https://github.com/Hardonian/mcpwall"
 readme = "README.md"
+
+[dependencies]
+sha2 = "0.10"
 
 [profile.release]
 opt-level = "z"
