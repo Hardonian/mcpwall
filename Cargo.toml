@@ -1,0 +1,15 @@
+[package]
+name = "mcpwall"
+version = "0.1.0"
+edition = "2024"
+description = "A local-first policy firewall and audit proxy for MCP stdio servers"
+license = "MIT"
+repository = "https://github.com/Hardonian/mcpwall"
+readme = "README.md"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

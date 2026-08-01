@@ -1,0 +1,11 @@
+# mcpwall v0.1 policy. One server section is selected with --server.
+[server.filesystem]
+command = "/usr/local/bin/mcp-filesystem"
+args = ["/home/scott/projects"]
+allowed_tools = ["read_file", "list_directory"]
+denied_tools = ["write_file", "delete_file"]
+require_approval = ["write_file", "delete_file", "move_file"]
+allowed_roots = ["/home/scott/projects"]
+redact_patterns = ["token", "password", "api_key", "secret", "private_key"]
+max_calls_per_minute = 60
+audit_path = "/tmp/mcpwall-filesystem.jsonl"
