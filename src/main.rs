@@ -1,8 +1,11 @@
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,7 +20,12 @@ struct Policy {
     allowed_roots: Vec<String>,
     redact_patterns: Vec<String>,
     max_calls_per_minute: usize,
+    max_request_bytes: usize,
+    max_argument_bytes: usize,
+    denied_argument_keys: Vec<String>,
+    denied_argument_values: Vec<String>,
     approval_ttl_seconds: u64,
+    inventory_max_age_seconds: u64,
     audit_path: PathBuf,
     inventory_path: Option<PathBuf>,
     require_known_tools: bool,
@@ -25,7 +33,7 @@ struct Policy {
 
 fn usage() {
     println!(
-        "mcpwall 0.3.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall inventory --config FILE --server NAME\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 0.4.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -61,7 +69,10 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
     let mut active = false;
     let mut p = Policy {
         max_calls_per_minute: 60,
+        max_request_bytes: 65_536,
+        max_argument_bytes: 32_768,
         approval_ttl_seconds: 300,
+        inventory_max_age_seconds: 0,
         audit_path: PathBuf::from("mcpwall-audit.jsonl"),
         ..Policy::default()
     };
@@ -95,10 +106,26 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
             p.max_calls_per_minute = v
                 .parse()
                 .map_err(|_| format!("invalid max_calls_per_minute: {v}"))?;
+        } else if let Some(v) = value_after(line, "max_request_bytes") {
+            p.max_request_bytes = v
+                .parse()
+                .map_err(|_| format!("invalid max_request_bytes: {v}"))?;
+        } else if let Some(v) = value_after(line, "max_argument_bytes") {
+            p.max_argument_bytes = v
+                .parse()
+                .map_err(|_| format!("invalid max_argument_bytes: {v}"))?;
+        } else if let Some(v) = value_after(line, "denied_argument_keys") {
+            p.denied_argument_keys = parse_array(v)?;
+        } else if let Some(v) = value_after(line, "denied_argument_values") {
+            p.denied_argument_values = parse_array(v)?;
         } else if let Some(v) = value_after(line, "approval_ttl_seconds") {
             p.approval_ttl_seconds = v
                 .parse()
                 .map_err(|_| format!("invalid approval_ttl_seconds: {v}"))?;
+        } else if let Some(v) = value_after(line, "inventory_max_age_seconds") {
+            p.inventory_max_age_seconds = v
+                .parse()
+                .map_err(|_| format!("invalid inventory_max_age_seconds: {v}"))?;
         } else if let Some(v) = value_after(line, "inventory_path") {
             p.inventory_path = Some(PathBuf::from(parse_string(v)?));
         } else if let Some(v) = value_after(line, "require_known_tools") {
@@ -149,19 +176,6 @@ fn json_string_fields(line: &str) -> Vec<String> {
     out
 }
 
-fn json_field(line: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\"");
-    let pos = line.find(&needle)?;
-    let rest = line[pos + needle.len()..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    if let Some(stripped) = rest.strip_prefix('"') {
-        let end = stripped.find('"')? + 1;
-        Some(rest[..=end].to_string())
-    } else {
-        Some(rest.split([',', '}']).next()?.trim().to_string())
-    }
-}
-
 fn named_values(line: &str, field: &str) -> Vec<String> {
     let needle = format!("\"{field}\"");
     let mut values = Vec::new();
@@ -181,13 +195,6 @@ fn named_values(line: &str, field: &str) -> Vec<String> {
         from = pos + needle.len();
     }
     values
-}
-
-fn tool_name(line: &str) -> Option<String> {
-    json_field(line, "name").and_then(|x| parse_string(&x).ok())
-}
-fn request_id(line: &str) -> String {
-    json_field(line, "id").unwrap_or_else(|| "null".into())
 }
 
 fn redact(mut line: String, patterns: &[String]) -> String {
@@ -230,7 +237,15 @@ fn audit(path: &Path, event: &str, patterns: &[String]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let safe = redact(event.to_string(), patterns);
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    #[cfg(unix)]
+    if path.exists() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut f = options.open(path)?;
     writeln!(f, "{safe}")
 }
 
@@ -319,14 +334,18 @@ fn save_approvals(p: &Policy, records: &[Approval]) -> io::Result<()> {
         .map(serialize_approval)
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(
-        &tmp,
-        if body.is_empty() {
-            String::new()
-        } else {
-            body + "\n"
-        },
-    )?;
+    let content = if body.is_empty() {
+        String::new()
+    } else {
+        body + "\n"
+    };
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
     fs::rename(tmp, path)
 }
 struct QueueLock {
@@ -500,13 +519,115 @@ fn inventory(p: &Policy) -> Result<(), String> {
     Ok(())
 }
 fn known_tool(p: &Policy, tool: &str) -> bool {
-    if !p.require_known_tools {
-        return true;
+    if !p.require_known_tools || !inventory_fresh(p) {
+        return !p.require_known_tools;
     }
     fs::read_to_string(inventory_path(p))
         .unwrap_or_default()
         .lines()
         .any(|x| x.trim() == tool)
+}
+
+fn inventory_fresh(p: &Policy) -> bool {
+    if p.inventory_max_age_seconds == 0 {
+        return true;
+    }
+    fs::metadata(inventory_path(p))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() <= p.inventory_max_age_seconds)
+}
+fn parse_request(line: &str, max_bytes: usize) -> Result<Value, String> {
+    if line.len() > max_bytes {
+        return Err(format!("request exceeds max_request_bytes={max_bytes}"));
+    }
+    serde_json::from_str(line).map_err(|e| format!("invalid JSON-RPC request: {e}"))
+}
+fn request_method(request: &Value) -> String {
+    request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+fn request_tool(request: &Value) -> Option<String> {
+    request
+        .pointer("/params/name")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+fn request_id_value(request: &Value) -> String {
+    request
+        .get("id")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "null".into())
+}
+fn argument_violation(value: &Value, p: &Policy) -> Option<String> {
+    let args = value.pointer("/params/arguments").unwrap_or(&Value::Null);
+    if args.to_string().len() > p.max_argument_bytes {
+        return Some(format!(
+            "arguments exceed max_argument_bytes={}",
+            p.max_argument_bytes
+        ));
+    }
+    fn walk(value: &Value, p: &Policy) -> Option<String> {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if p.denied_argument_keys.iter().any(|x| x == key) {
+                        return Some(format!("argument key denied: {key}"));
+                    }
+                    match child {
+                        Value::String(text)
+                            if p.denied_argument_values.iter().any(|x| text.contains(x)) =>
+                        {
+                            return Some(format!("argument value denied for key: {key}"));
+                        }
+                        _ => {}
+                    }
+                    if let Some(reason) = walk(child, p) {
+                        return Some(reason);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    if let Some(reason) = walk(child, p) {
+                        return Some(reason);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+    walk(args, p)
+}
+
+fn status(p: &Policy) -> Result<(), String> {
+    let approvals = load_approvals(p);
+    let mut counts = std::collections::BTreeMap::new();
+    for approval in approvals {
+        *counts.entry(approval.state).or_insert(0usize) += 1;
+    }
+    println!("version: 0.4.0");
+    println!("command: {}", p.command);
+    println!("audit_exists: {}", p.audit_path.exists());
+    println!(
+        "audit_bytes: {}",
+        fs::metadata(&p.audit_path).map(|m| m.len()).unwrap_or(0)
+    );
+    println!("approval_queue: {}", approval_path(p).display());
+    println!("approval_counts: {:?}", counts);
+    println!("inventory: {}", inventory_path(p).display());
+    println!("inventory_fresh: {}", inventory_fresh(p));
+    println!(
+        "limits: request_bytes={} argument_bytes={} calls_per_minute={}",
+        p.max_request_bytes, p.max_argument_bytes, p.max_calls_per_minute
+    );
+    println!("status: healthy");
+    Ok(())
 }
 
 fn doctor(p: &Policy) -> Result<(), String> {
@@ -536,6 +657,9 @@ fn doctor(p: &Policy) -> Result<(), String> {
                 path.display()
             ));
         }
+        if !inventory_fresh(p) {
+            return Err(format!("tool inventory is stale: {}", path.display()));
+        }
         println!("inventory: {}", path.display());
     }
     println!("audit: {}", p.audit_path.display());
@@ -561,15 +685,30 @@ fn proxy(p: &Policy) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let method = json_field(&line, "method")
-            .and_then(|x| parse_string(&x).ok())
-            .unwrap_or_default();
+        let request = match parse_request(&line, p.max_request_bytes) {
+            Ok(value) => value,
+            Err(reason) => {
+                let out = error_response("null", &reason);
+                println!("{out}");
+                audit(
+                    &p.audit_path,
+                    &format!(
+                        r#"{{"event":"deny","reason":"invalid_request","detail":"{}"}}"#,
+                        reason.replace('"', "'")
+                    ),
+                    &p.redact_patterns,
+                )
+                .map_err(|e| e.to_string())?;
+                continue;
+            }
+        };
+        let method = request_method(&request);
         let tool = if method == "tools/call" {
-            tool_name(&line)
+            request_tool(&request)
         } else {
             None
         };
-        let id = request_id(&line);
+        let id = request_id_value(&request);
         let hash = request_hash(&line);
         let ts = now();
         while calls.front().is_some_and(|x| *x + 60 <= ts) {
@@ -588,6 +727,17 @@ fn proxy(p: &Policy) -> Result<(), String> {
         }
         calls.push_back(ts);
         if let Some(t) = &tool {
+            if let Some(reason) = argument_violation(&request, p) {
+                let out = error_response(&id, &reason);
+                println!("{out}");
+                audit(
+                    &p.audit_path,
+                    &format!(r#"{{"event":"deny","reason":"argument","tool":"{t}","id":{id}}}"#),
+                    &p.redact_patterns,
+                )
+                .map_err(|e| e.to_string())?;
+                continue;
+            }
             if p.denied_tools.iter().any(|x| x == t)
                 || (!p.allowed_tools.is_empty() && !p.allowed_tools.iter().any(|x| x == t))
                 || !known_tool(p, t)
@@ -691,6 +841,7 @@ fn main() {
         let policy = load_policy(&config, &server)?;
         match command.as_str() {
             "doctor" => doctor(&policy),
+            "status" => status(&policy),
             "proxy" => proxy(&policy),
             "inventory" => inventory(&policy),
             "approvals" => {
@@ -733,10 +884,10 @@ mod tests {
     }
     #[test]
     fn fields_parse() {
-        assert_eq!(
-            tool_name(r#"{"method":"tools/call","params":{"name":"read_file"}}"#).as_deref(),
-            Some("read_file")
-        );
+        let value: Value =
+            serde_json::from_str(r#"{"method":"tools/call","params":{"name":"read_file"}}"#)
+                .unwrap();
+        assert_eq!(request_tool(&value).as_deref(), Some("read_file"));
     }
     #[test]
     fn redacts_values() {
@@ -753,6 +904,25 @@ mod tests {
             request_hash("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+    #[test]
+    fn argument_policy_blocks_dangerous_key_and_value() {
+        let p = Policy {
+            max_argument_bytes: 100,
+            denied_argument_keys: vec!["shell".into()],
+            denied_argument_values: vec!["PRIVATE".into()],
+            ..Policy::default()
+        };
+        let key: Value = serde_json::from_str(r#"{"params":{"arguments":{"shell":"x"}}}"#).unwrap();
+        assert!(argument_violation(&key, &p).is_some());
+        let value: Value =
+            serde_json::from_str(r#"{"params":{"arguments":{"note":"PRIVATE"}}}"#).unwrap();
+        assert!(argument_violation(&value, &p).is_some());
+    }
+    #[test]
+    fn malformed_and_oversized_requests_fail_closed() {
+        assert!(parse_request("not-json", 100).is_err());
+        assert!(parse_request("{}", 1).is_err());
     }
     #[test]
     fn approval_round_trip() {

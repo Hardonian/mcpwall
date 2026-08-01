@@ -28,7 +28,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-The release binary is `target/release/mcpwall` (currently v0.3.0).
+The release binary is `target/release/mcpwall` (currently v0.4.0).
 
 ## Configure
 
@@ -90,11 +90,33 @@ require_known_tools = true
 
 When enabled, a `tools/call` for a tool absent from the captured inventory is rejected. This is a conservative capability snapshot, not a substitute for full JSON Schema validation.
 
+## v0.4 hardening and operations
+
+v0.4 adds a real JSON parser and fail-closed request controls:
+
+```toml
+max_request_bytes = 65536
+max_argument_bytes = 32768
+denied_argument_keys = ["command", "shell", "eval"]
+denied_argument_values = ["/etc/shadow", "BEGIN OPENSSH PRIVATE KEY"]
+inventory_max_age_seconds = 86400
+```
+
+Malformed JSON-RPC, oversized requests, oversized arguments, denied argument keys, and denied argument values are rejected before forwarding. Audit and approval files are forced to mode `0600` on Unix systems.
+
+Operational status:
+
+```sh
+./target/release/mcpwall status --config /tmp/mcpwall.toml --server filesystem
+```
+
+`status` reports audit size, approval state counts, inventory freshness, and active limits without starting the child server.
+
 ## Security model and limitations
 
 - Bind the MCP client and server to the same user account or use filesystem permissions around the proxy and audit files.
 - Keep the audit file outside shared or web-served directories.
-- Path checks are lexical in v0.3; they do not resolve symlinks. Do not treat them as a complete filesystem sandbox.
+- Path checks are lexical in v0.4; they do not resolve symlinks. Do not treat them as a complete filesystem sandbox.
 - There is no TLS because stdio is local. For network transport, use a separately authenticated local gateway.
 - The policy parser is deliberately narrow. Invalid or missing policy values fail closed.
 - Approval records bind the JSON-RPC request ID and SHA-256 request hash; clients should use unique request IDs for approval-gated calls.
