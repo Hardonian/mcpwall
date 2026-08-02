@@ -6,7 +6,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -189,10 +189,52 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
         if has_path_policy && policy.allowed_roots.is_empty() {
             return Err("production_mode path policies require non-empty allowed_roots".into());
         }
+        validate_private_state_path(&policy.audit_path)?;
+        validate_private_state_path(&inventory_path(&policy))?;
     }
     validate_schema_files(&policy)?;
     validate_sandbox_policy(&policy.sandbox)?;
     Ok(policy)
+}
+
+fn validate_private_state_path(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("state path has no parent: {}", path.display()))?;
+    let parent_meta = fs::symlink_metadata(parent)
+        .map_err(|e| format!("private state directory {}: {e}", parent.display()))?;
+    if !parent_meta.is_dir() {
+        return Err(format!(
+            "private state parent is not a directory: {}",
+            parent.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        if parent_meta.uid() != unsafe { libc::geteuid() } as u32 || parent_meta.mode() & 0o077 != 0
+        {
+            return Err(format!(
+                "private state directory must be owner-only and owned by the effective user: {}",
+                parent.display()
+            ));
+        }
+    }
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(format!(
+                "private state path is not a regular file: {}",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        if meta.uid() != unsafe { libc::geteuid() } as u32 || meta.mode() & 0o077 != 0 {
+            return Err(format!(
+                "private state file must be owner-only: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_sandbox_policy(sandbox: &SandboxPolicy) -> Result<(), String> {
@@ -368,6 +410,8 @@ fn audit(path: &Path, event: &str, patterns: &[String]) -> io::Result<()> {
     options.create(true).append(true);
     #[cfg(unix)]
     options.mode(0o600);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
     let mut f = options.open(path)?;
     writeln!(f, "{safe}")
 }
