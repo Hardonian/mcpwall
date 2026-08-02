@@ -11,7 +11,7 @@ readme = "README.md"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-toml = "0.8"
+toml = "1.1"
 jsonschema = { version = "0.49", default-features = false, features = ["resolve-file"] }
 libc = "0.2"
 
