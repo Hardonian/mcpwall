@@ -9,14 +9,18 @@ Protected assets:
 - Destructive MCP tools
 - Local MCP server availability
 
-Out of scope for v0.1:
+## Current scope and limitations
 
-- Kernel-level sandboxing
-- Symlink-safe filesystem confinement
+The optional Linux sandbox now provides process groups, environment isolation, resource limits, wall-clock cleanup, `PR_SET_NO_NEW_PRIVS`, a selected x86_64 seccomp deny filter, and optional UID/GID dropping. These controls are user-space hardening, not a complete kernel sandbox.
+
+Still out of scope:
+
+- Mount namespace or read-only root filesystem isolation
+- Automatic user namespace mapping
+- Complete syscall allowlisting
+- Protection against root, kernel compromise, or malicious same-user processes
+- Compromised MCP server binaries that exploit an unblocked kernel/application path
 - TLS/network MCP transport
-- Full JSON parser/schema validation
-- Malicious same-user processes
-- Compromised MCP server binaries
 
 Required deployment posture:
 

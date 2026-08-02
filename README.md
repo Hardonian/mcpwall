@@ -1,45 +1,100 @@
 # mcpwall
 
-Local-first policy firewall and audit proxy for MCP stdio servers.
+[![CI](https://github.com/Hardonian/mcpwall/actions/workflows/ci.yml/badge.svg)](https://github.com/Hardonian/mcpwall/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Hardonian/mcpwall?display_name=tag&sort=semver)](https://github.com/Hardonian/mcpwall/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-mcpwall is a small Rust native binary that sits between an MCP client and an MCP server. It forwards newline-delimited JSON-RPC only when the request satisfies a local policy.
+**A local-first policy firewall and audit proxy for MCP stdio servers.**
 
-It currently provides:
+mcpwall sits between an MCP client and a local MCP server, validates every JSON-RPC request against an inspectable TOML policy, and forwards only requests that pass. It is a small Rust binary with no cloud control plane, telemetry, Docker dependency, database, or network transport.
 
-- Explicit tool allowlists and denylists
-- Approval gates for destructive tools
-- Absolute-path restrictions for tool arguments
-- Per-minute call limits
-- Redacted JSONL audit records
-- Hash-bound, one-time approval queue with TTLs
-- `approvals` status command and atomic local queue writes
-- MCP `tools/list` inventory capture with optional fail-closed known-tool enforcement
-- `doctor` checks before starting a server
-- No cloud service, telemetry, Docker, or application runtime
+It is designed for operators who want a boring, reviewable trust boundary around filesystem tools, coding agents, browser agents, automation servers, and private AI infrastructure.
 
-This is a security boundary, not a complete MCP protocol implementation. It intentionally uses a conservative JSON-RPC line proxy for MCP stdio servers and should be placed in front of a server that uses one JSON message per line.
+## Why mcpwall
 
-## Build
+MCP servers can expose powerful capabilities through a convenient tool interface. The operational failure mode is rarely an exotic exploit; it is an over-broad tool, an unsafe path, an accidental secret in logs, a stale capability list, or a destructive call that was forwarded without a human gate.
+
+mcpwall makes those decisions explicit and locally auditable:
+
+- **Policy before forwarding** — malformed, oversized, unauthorized, or unsafe requests fail closed.
+- **Least privilege** — tool allowlists, denylists, per-tool argument rules, JSON Schema, and path roots.
+- **Human gates** — destructive calls bind to an exact request ID and SHA-256 request hash, expire, and can be consumed once.
+- **Runtime hardening** — optional process groups, environment isolation, resource limits, timeout cleanup, `NoNewPrivileges`, seccomp denial rules, and UID/GID dropping.
+- **Evidence** — redacted JSONL audit records, capability inventory, status diagnostics, checksums, and release manifests.
+- **Sovereign operation** — local TOML and JSON Schema files; network schema resolution is disabled.
+
+## What it is — and is not
+
+mcpwall is a local policy firewall and process-hardening layer. It is not a complete MCP implementation, container runtime, kernel security boundary, or hosted security service. It cannot protect against root, a malicious same-user process, a compromised kernel/host, or a fully compromised child that finds a vulnerability outside the controls enabled in its policy.
+
+Use it when you need a small, inspectable control point. Use a properly configured container, VM, dedicated service account, or stronger sandbox when you need those guarantees.
+
+## Features
+
+- Single-object newline-delimited JSON-RPC 2.0 validation
+- Tool allowlists and denylists
+- Per-tool allowed and required argument fields
+- Per-tool JSON type checks
+- External local JSON Schema validation with `$ref`/`$defs`, nested objects, arrays, combinators, enums, patterns, and conditionals supported by the validator
+- Symlink-aware canonical path enforcement for existing files and parents
+- Request and argument byte limits
+- Denied argument keys and values
+- Per-minute rate limits
+- One-time, TTL-bound, SHA-256-bound approvals
+- MCP `tools/list` inventory capture and optional known-tool enforcement
+- Redacted JSONL audit logging with restrictive Unix permissions
+- Optional Linux sandbox process groups and descendant cleanup
+- Optional Linux x86_64 seccomp deny filter for selected high-risk syscalls
+- Optional Linux mount namespace and read-only root filesystem hardening
+- Optional Linux capability bounding-set drops
+- Optional non-root UID/GID execution identity with fail-closed validation
+- `doctor`, `status`, `inventory`, `approvals`, `approve`, and `deny` commands
+- Release manifests, SHA-256 checksums, dependency metadata, and CI verification
+
+## Quick start
+
+Build locally:
 
 ```sh
-cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
+./target/release/mcpwall --help
 ```
 
-The release binary is `target/release/mcpwall` (currently v0.9.0).
+Install from a source checkout:
 
-## Configure
+```sh
+PREFIX="$HOME/.local" ./install.sh
+"$HOME/.local/bin/mcpwall" --help
+```
 
-Copy `mcpwall.example.toml` and change the server command, arguments, roots, schema files, and audit path. The policy file is parsed as TOML. JSON Schema files are parsed and compiled at startup; missing, malformed, or unsupported schemas fail closed before the child starts.
+Copy and inspect the example policy:
 
 ```sh
 cp mcpwall.example.toml /tmp/mcpwall.toml
 ./target/release/mcpwall doctor --config /tmp/mcpwall.toml --server filesystem
 ```
 
-## Run as an MCP stdio proxy
+The example command is intentionally a placeholder. Replace `command`, `args`, allowed roots, and audit paths before using it with a real server.
+
+## Minimal policy
+
+```toml
+[server.filesystem]
+command = "/usr/local/bin/mcp-filesystem"
+args = ["/home/scott/projects"]
+allowed_tools = ["read_file", "list_directory"]
+denied_tools = ["write_file", "delete_file"]
+allowed_roots = ["/home/scott/projects"]
+audit_path = "/home/scott/.local/state/mcpwall/filesystem.jsonl"
+
+[server.filesystem.tool_policies.read_file]
+allowed_arguments = ["path"]
+required_arguments = ["path"]
+argument_types = { path = "string" }
+path_arguments = ["path"]
+```
+
+Run the proxy:
 
 ```sh
 ./target/release/mcpwall proxy \
@@ -47,78 +102,27 @@ cp mcpwall.example.toml /tmp/mcpwall.toml
   --server filesystem
 ```
 
-The proxy reads requests from stdin and writes responses to stdout. Child stderr is inherited for diagnostics. Audit records are written to the configured path. Never put secrets in the policy file or command-line arguments.
+The proxy reads requests from stdin and writes responses to stdout. Child stderr is inherited for diagnostics. Keep policy, audit, approval, and inventory files on a private local filesystem.
 
-## v0.2 approval queue
+## Operational workflow
 
-A request whose tool is listed in `require_approval` returns an error containing both `request_id` and a SHA-256 `request_hash`. The exact request body must be approved; changing the arguments produces a different hash and cannot reuse the approval.
+1. Run `doctor` and fix every reported configuration error.
+2. Capture the child capability set with `inventory`.
+3. Enable `require_known_tools` only after reviewing the inventory.
+4. Run `status` and confirm audit/approval permissions.
+5. Exercise a representative allowed request and a denied request.
+6. For destructive tools, capture `request_id` and `request_hash`, approve the exact hash, retry once, and verify the approval becomes `consumed`.
+7. Keep the proxy and child under the least-privileged suitable account.
 
-```sh
-# list request_id, request_hash, tool, state, created_at, expires_at
-./target/release/mcpwall approvals --config /tmp/mcpwall.toml --server filesystem
+See [docs/operations.md](docs/operations.md) for installation, rollback, approvals, inventory freshness, sandbox operation, and incident handling.
 
-./target/release/mcpwall approve \
-  --config /tmp/mcpwall.toml \
-  --server filesystem \
-  --hash REQUEST_HASH \
-  --ttl 300 \
-  REQUEST_ID
+## Security model
 
-./target/release/mcpwall deny \
-  --config /tmp/mcpwall.toml \
-  --server filesystem \
-  --hash REQUEST_HASH \
-  REQUEST_ID
-```
+See [docs/threat-model.md](docs/threat-model.md) for protected assets, assumptions, mitigations, and explicit limitations. Security controls are opt-in where compatibility requires it; the default policy remains conservative but does not silently alter an existing child’s runtime.
 
-Approved requests are consumed once and expire automatically. Queue updates use a create-new lock and atomic rename. The queue is stored beside the audit file as `<audit_path>.approvals.tsv`; it contains no request payload, only the hash and metadata.
+## Linux runtime hardening
 
-## v0.3 capability inventory
-
-Capture the child server's advertised tools before enabling known-tool enforcement:
-
-```sh
-./target/release/mcpwall inventory --config /tmp/mcpwall.toml --server filesystem
-```
-
-Set these policy fields:
-
-```toml
-inventory_path = "/tmp/mcpwall-filesystem.tools"
-require_known_tools = true
-```
-
-When enabled, a `tools/call` for a tool absent from the captured inventory is rejected. This is a conservative capability snapshot, not a substitute for full JSON Schema validation.
-
-## v0.4 hardening and operations
-
-v0.4 adds a real JSON parser and fail-closed request controls:
-
-```toml
-max_request_bytes = 65536
-max_argument_bytes = 32768
-denied_argument_keys = ["command", "shell", "eval"]
-denied_argument_values = ["/etc/shadow", "BEGIN OPENSSH PRIVATE KEY"]
-inventory_max_age_seconds = 86400
-```
-
-Malformed JSON-RPC, oversized requests, oversized arguments, denied argument keys, and denied argument values are rejected before forwarding. Audit and approval files are forced to mode `0600` on Unix systems.
-
-Operational status:
-
-```sh
-./target/release/mcpwall status --config /tmp/mcpwall.toml --server filesystem
-```
-
-`status` reports audit size, approval state counts, inventory freshness, and active limits without starting the child server.
-
-## v0.5 configuration hardening
-
-The policy file is now parsed by the TOML library rather than the former line parser. Quoted `#` characters, escaped strings, inline arrays, and malformed TOML are handled by the parser. Unknown or malformed configuration is rejected before the child server starts.
-
-## v0.8 Linux sandboxed launcher
-
-The optional per-server sandbox adds real child-process controls on Unix/Linux:
+The sandbox is opt-in per server:
 
 ```toml
 [server.filesystem.sandbox]
@@ -131,72 +135,47 @@ max_memory_bytes = 1073741824
 max_cpu_seconds = 60
 max_file_bytes = 104857600
 max_open_files = 256
-# Linux per-user/thread limit; leave 0 unless you understand host-wide semantics.
 max_processes = 0
-network_namespace = false
 seccomp_deny_dangerous = true
-# Optional identity drop; a different UID/GID requires a privileged launcher.
+mount_namespace = true
+read_only_filesystem = true
+drop_capabilities = [21, 22]
 # run_as_uid = 65534
 # run_as_gid = 65534
 ```
 
-When enabled, mcpwall:
+The launcher provides process groups, environment isolation, resource limits, wall-clock cleanup, `PR_SET_NO_NEW_PRIVS`, selected x86_64 seccomp denial, optional mount namespace/read-only root hardening, capability bounding-set drops, and optional UID/GID dropping. `RLIMIT_NPROC` is per-user/thread rather than child-only. Mount and capability controls require host privileges such as `CAP_SYS_ADMIN`; if the host denies them, startup fails closed. This is not a complete container, syscall allowlist, user-namespace mapping, or protection from a privileged host attacker.
 
-- Creates a dedicated process group/session
-- Sets Linux `PR_SET_NO_NEW_PRIVS`
-- Applies `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, and optional `RLIMIT_NPROC`
-- Clears inherited environment variables when configured
-- Re-adds only explicitly allowlisted variables
-- Enforces a wall-clock timeout and kills the entire child process group
-- Validates the working directory before startup
-- Can request a separate network namespace with `network_namespace = true`; if the host denies `unshare`, startup fails closed
-- Can deny high-risk kernel interfaces with an x86_64 seccomp filter (`ptrace`, mount/namespace changes, module loading, `bpf`, perf events, process-memory access, and related interfaces)
-- Can drop to a configured non-root UID/GID before the child executes
 
-`seccomp_deny_dangerous` is a deny filter, not a complete syscall allowlist. It preserves normal MCP server operation while returning `EPERM` for selected high-risk interfaces. It is currently implemented and verified on Linux x86_64; unsupported architectures fail closed if enabled. Identity changes require the parent process to have the host privilege to perform them; unauthorized changes fail before child startup. The configured UID must never be root.
+Each tagged release produces:
 
-`max_processes` is deliberately opt-in because Linux applies `RLIMIT_NPROC` to the user’s processes/threads, not only this child. A value that is too low can prevent otherwise-valid subprocesses from starting or affect unrelated same-user workloads.
+- Linux x86_64 GNU/glibc binary
+- `RELEASE-MANIFEST.json` containing version, target, asset, and SHA-256
+- `SHA256SUMS` covering the binary, manifest, and dependency metadata
+- `DEPENDENCY-METADATA.json` generated from the locked Cargo graph
+- A compressed release archive
+- GitHub Actions build provenance when the release workflow runs with repository attestation permissions
 
-This is meaningful process hardening, but it is not equivalent to a container or complete kernel sandbox. It does not provide mount isolation, user-ID remapping by itself, or protection from a privileged host attacker.
-
-## v0.7 full JSON Schema enforcement
-
-Each tool can reference an external JSON Schema file:
-
-```toml
-tool_schemas = { read_file = "schemas/read_file.json" }
-```
-
-Schema paths are resolved relative to the policy file. mcpwall compiles every configured schema before starting the child and rejects the entire configuration if a schema is missing, malformed, or invalid. The validator supports standard JSON Schema drafts and arbitrary nested constraints, including `$ref`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`, numeric/string limits, patterns, `oneOf`, `anyOf`, `allOf`, `not`, and conditional schemas supported by the validator. Network schema resolution is intentionally disabled; use local files for sovereign operation.
-
-Validation applies to the exact `params.arguments` value before legacy typed rules, denied-argument scanning, path checks, approval gates, and forwarding. Schema failures are written to the audit log with `reason: "json_schema"` without persisting the rejected request in the denial event.
-
-Tagged releases generate:
-
-- `RELEASE-MANIFEST.json` with name, version, target, asset, and SHA-256
-- `SHA256SUMS` covering the binary and manifest
-- A tarball containing the binary, manifest, and checksums
-
-The manifest is integrity metadata, not a cryptographic signature. GitHub Actions provenance/signing remains a separate trust-layer decision.
-
-## Security model and limitations
-
-- Bind the MCP client and server to the same user account or use filesystem permissions around the proxy and audit files.
-- Keep the audit file outside shared or web-served directories.
-- Path checks canonicalize existing files and symlinked parents, then normalize non-existent paths; they are still not a complete filesystem sandbox.
-- There is no TLS because stdio is local. For network transport, use a separately authenticated local gateway.
-- TOML policy parsing and JSON Schema compilation fail closed on invalid or missing values.
-- Approval records bind the JSON-RPC request ID and SHA-256 request hash; clients should use unique request IDs for approval-gated calls.
-
-## Development fixture
-
-The repository includes a tiny shell MCP-like line server for integration smoke tests:
+Checksums are integrity metadata. They are not a signature. Verify the artifact before installation:
 
 ```sh
-chmod +x tests/fixture.sh
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/home/scott/projects/a.txt","api_key":"do-not-log"}}}' \
-  | ./target/release/mcpwall proxy --config /tmp/mcpwall.toml --server filesystem
+sha256sum -c SHA256SUMS
 ```
+
+The default artifact is dynamically linked to glibc; it is not advertised as static.
+
+## Development verification
+
+```sh
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+cargo audit
+cargo build --release
+```
+
+The repository includes a deterministic shell MCP fixture under `tests/fixture.sh`. Runtime hardening probes cover environment isolation, working-directory enforcement, `NoNewPrivileges`, timeout process-group cleanup, seccomp denial, network namespace fail-closed behavior, and identity-drop behavior.
 
 ## License
 

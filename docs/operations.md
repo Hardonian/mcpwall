@@ -80,6 +80,9 @@ max_open_files = 256
 max_processes = 0
 network_namespace = false
 seccomp_deny_dangerous = true
+mount_namespace = true
+read_only_filesystem = true
+drop_capabilities = [21, 22]
 # Optional identity drop; different UID/GID requires a privileged launcher.
 # run_as_uid = 65534
 # run_as_gid = 65534

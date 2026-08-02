@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   linux-x86_64:
@@ -38,8 +40,13 @@ jobs:
               "sha256": hashlib.sha256(data).hexdigest(),
           }, indent=2, sort_keys=True))
           PY
-          sha256sum "$asset" RELEASE-MANIFEST.json > SHA256SUMS
-          tar -czf "mcpwall-${version}-linux-x86_64.tar.gz" "$asset" RELEASE-MANIFEST.json SHA256SUMS
+          cargo metadata --locked --format-version 1 > DEPENDENCY-METADATA.json
+          sha256sum "$asset" RELEASE-MANIFEST.json DEPENDENCY-METADATA.json > SHA256SUMS
+          tar -czf "mcpwall-${version}-linux-x86_64.tar.gz" "$asset" RELEASE-MANIFEST.json DEPENDENCY-METADATA.json SHA256SUMS
+      - name: Attest release binary
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ github.workspace }}/mcpwall-linux-x86_64-gnu
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -47,3 +54,4 @@ jobs:
             mcpwall-*-linux-x86_64.tar.gz
             SHA256SUMS
             RELEASE-MANIFEST.json
+            DEPENDENCY-METADATA.json

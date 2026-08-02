@@ -83,6 +83,12 @@ struct SandboxPolicy {
     network_namespace: bool,
     #[serde(default)]
     seccomp_deny_dangerous: bool,
+    #[serde(default)]
+    mount_namespace: bool,
+    #[serde(default)]
+    read_only_filesystem: bool,
+    #[serde(default)]
+    drop_capabilities: Vec<u32>,
     run_as_uid: Option<u32>,
     run_as_gid: Option<u32>,
 }
@@ -122,7 +128,7 @@ struct Config {
 
 fn usage() {
     println!(
-        "mcpwall 0.9.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 1.0.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -162,6 +168,21 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
 }
 
 fn validate_sandbox_policy(sandbox: &SandboxPolicy) -> Result<(), String> {
+    if sandbox.read_only_filesystem && !sandbox.mount_namespace {
+        return Err("sandbox.read_only_filesystem requires mount_namespace = true".into());
+    }
+    if sandbox.drop_capabilities.iter().any(|cap| *cap > 63) {
+        return Err(
+            "sandbox.drop_capabilities values must be Linux capability numbers 0..=63".into(),
+        );
+    }
+    if sandbox
+        .drop_capabilities
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
+        return Err("sandbox.drop_capabilities must not contain duplicates".into());
+    }
     if sandbox.run_as_uid.is_some() != sandbox.run_as_gid.is_some() {
         return Err("sandbox.run_as_uid and run_as_gid must be provided together".into());
     }
@@ -824,11 +845,14 @@ fn doctor(p: &Policy) -> Result<(), String> {
     println!("approval rules: {}", p.require_approval.len());
     println!("approval ttl: {}s", p.approval_ttl_seconds);
     println!(
-        "sandbox: enabled={} timeout_seconds={} network_namespace={} seccomp_deny_dangerous={} run_as_uid={:?} run_as_gid={:?}",
+        "sandbox: enabled={} timeout_seconds={} network_namespace={} seccomp_deny_dangerous={} mount_namespace={} read_only_filesystem={} drop_capabilities={:?} run_as_uid={:?} run_as_gid={:?}",
         p.sandbox.enabled,
         p.sandbox.timeout_seconds,
         p.sandbox.network_namespace,
         p.sandbox.seccomp_deny_dangerous,
+        p.sandbox.mount_namespace,
+        p.sandbox.read_only_filesystem,
+        p.sandbox.drop_capabilities,
         p.sandbox.run_as_uid,
         p.sandbox.run_as_gid
     );
@@ -987,6 +1011,89 @@ fn apply_uid_gid(uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn apply_linux_mount_hardening(
+    mount_namespace: bool,
+    read_only_filesystem: bool,
+) -> io::Result<()> {
+    if !mount_namespace {
+        return if read_only_filesystem {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read-only filesystem requires mount namespace",
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNS) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if read_only_filesystem
+            && libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
+                std::ptr::null(),
+            ) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_linux_mount_hardening(
+    mount_namespace: bool,
+    _read_only_filesystem: bool,
+) -> io::Result<()> {
+    if mount_namespace {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mount namespace is only implemented on Linux",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drop_linux_capabilities(capabilities: &[u32]) -> io::Result<()> {
+    for &capability in capabilities {
+        let result =
+            unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability as libc::c_ulong, 0, 0, 0) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_linux_capabilities(capabilities: &[u32]) -> io::Result<()> {
+    if capabilities.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "capability dropping is only implemented on Linux",
+        ))
+    }
+}
+
 #[cfg(unix)]
 fn apply_sandbox(command: &mut Command, sandbox: &SandboxPolicy) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
@@ -1021,10 +1128,12 @@ fn apply_sandbox(command: &mut Command, sandbox: &SandboxPolicy) -> Result<(), S
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
+            apply_linux_mount_hardening(limits.mount_namespace, limits.read_only_filesystem)?;
             if limits.network_namespace && libc::unshare(libc::CLONE_NEWNET) == -1 {
                 return Err(io::Error::last_os_error());
             }
             apply_uid_gid(limits.run_as_uid, limits.run_as_gid)?;
+            drop_linux_capabilities(&limits.drop_capabilities)?;
             if limits.seccomp_deny_dangerous {
                 install_seccomp_deny_filter()?;
             }

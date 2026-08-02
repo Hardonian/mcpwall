@@ -10,13 +10,20 @@ if command -v cargo >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
 else
   OS_LC=$(uname -s | tr '[:upper:]' '[:lower:]')
   ARCH=$(uname -m)
+  if [ "$OS_LC" != linux ] || [ "$ARCH" != x86_64 ]; then
+    printf 'no verified prebuilt artifact for %s/%s; build from source with Rust\n' "$OS_LC" "$ARCH" >&2
+    exit 1
+  fi
   BASE=${RELEASE_BASE:-https://github.com/Hardonian/mcpwall/releases/latest/download}
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT
-  curl -fsSL "$BASE/$NAME-$OS_LC-$ARCH-static" -o "$tmp"
-  chmod +x "$tmp"
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "$tmpdir"' EXIT
+  asset="$NAME-linux-x86_64-gnu"
+  curl -fsSL "$BASE/$asset" -o "$tmpdir/$asset"
+  curl -fsSL "$BASE/RELEASE-MANIFEST.json" -o "$tmpdir/RELEASE-MANIFEST.json"
+  curl -fsSL "$BASE/SHA256SUMS" -o "$tmpdir/SHA256SUMS"
+  (cd "$tmpdir" && sha256sum -c SHA256SUMS)
   install -d "$PREFIX/bin"
-  install -m 0755 "$tmp" "$PREFIX/bin/$NAME"
+  install -m 0755 "$tmpdir/$asset" "$PREFIX/bin/$NAME"
 fi
 "$PREFIX/bin/$NAME" --help
 printf 'installed %s to %s/bin/%s\n' "$NAME" "$PREFIX" "$NAME"
