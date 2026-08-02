@@ -52,6 +52,10 @@ For interactive approval:
 
 An approval does not authorize modified arguments and cannot be replayed.
 
+## Strict production mode
+
+Set `production_mode = true` for a fail-closed production policy. It requires an enabled sandbox, explicit non-root UID/GID, explicit allowed tools, a positive timeout, non-empty `allowed_roots` for path policies, and owner-controlled private state paths. The state directory must already exist, must not be a symlink, must be owned by the effective user, and must not grant group/other permissions. Compatibility mode remains available for local development but does not enforce these production prerequisites.
+
 ## Lab health checks
 
 ```sh
