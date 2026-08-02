@@ -12,11 +12,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct Policy {
     command: String,
     #[serde(default)]
@@ -59,6 +61,7 @@ struct Policy {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct SandboxPolicy {
     #[serde(default)]
     enabled: bool,
@@ -94,6 +97,7 @@ struct SandboxPolicy {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct ToolPolicy {
     #[serde(default)]
     allowed_arguments: Vec<String>,
@@ -122,13 +126,14 @@ fn default_audit_path() -> PathBuf {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     server: BTreeMap<String, Policy>,
 }
 
 fn usage() {
     println!(
-        "mcpwall 1.0.3 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 1.0.4 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -560,8 +565,10 @@ fn inventory_path(p: &Policy) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(format!("{}.tools", p.audit_path.display())))
 }
 fn inventory(p: &Policy) -> Result<(), String> {
-    let mut child = Command::new(&p.command)
-        .args(&p.args)
+    let mut command = Command::new(&p.command);
+    command.args(&p.args);
+    apply_sandbox(&mut command, &p.sandbox)?;
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -573,15 +580,52 @@ fn inventory(p: &Policy) -> Result<(), String> {
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n")
         .map_err(|e| e.to_string())?;
     input.flush().map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(output);
-    let mut response = String::new();
-    reader.read_line(&mut response).map_err(|e| e.to_string())?;
+    drop(input);
+    let (response_tx, response_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(output);
+        let mut response = String::new();
+        let result = reader.read_line(&mut response).map(|_| response);
+        let _ = response_tx.send(result);
+    });
+    let timeout = if p.sandbox.timeout_seconds == 0 {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(p.sandbox.timeout_seconds)
+    };
+    let deadline = Instant::now() + timeout;
+    let response = loop {
+        match response_rx.try_recv() {
+            Ok(result) => break result.map_err(|e| e.to_string())?,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("child output reader stopped unexpectedly".into());
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if child
+            .try_wait()
+            .map_err(|e| format!("wait for inventory child: {e}"))?
+            .is_some()
+        {
+            return Err("child exited without tools/list response".into());
+        }
+        if Instant::now() >= deadline {
+            kill_process_group(&mut child);
+            let _ = child.wait();
+            return Err("inventory child timed out".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     if response.is_empty() {
+        kill_process_group(&mut child);
+        let _ = child.wait();
         return Err("child exited without tools/list response".into());
     }
     let mut names = named_values(&response, "name");
     names.sort();
     names.dedup();
+    kill_process_group(&mut child);
+    let _ = child.wait();
     let path = inventory_path(p);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -597,7 +641,6 @@ fn inventory(p: &Policy) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     fs::rename(tmp, &path).map_err(|e| e.to_string())?;
-    let _ = child.kill();
     println!("inventory: {} tools", names.len());
     println!("path: {}", path.display());
     for name in names {
@@ -626,13 +669,17 @@ fn inventory_fresh(p: &Policy) -> bool {
         .is_some_and(|age| age.as_secs() <= p.inventory_max_age_seconds)
 }
 fn path_allowed(value: &str, roots: &[String]) -> bool {
-    if roots.is_empty() || !value.starts_with('/') {
+    if roots.is_empty() {
         return true;
     }
-    let candidate = normalized_path(Path::new(value));
+    let candidate = Path::new(value);
+    if !candidate.is_absolute() {
+        return false;
+    }
+    let candidate = normalized_path(candidate);
     roots.iter().any(|root| {
-        let root = normalized_path(Path::new(root));
-        candidate == root || candidate.starts_with(root)
+        let root_path = normalized_path(Path::new(root));
+        candidate == root_path || candidate.strip_prefix(&root_path).is_ok()
     })
 }
 
@@ -805,7 +852,8 @@ fn status(p: &Policy) -> Result<(), String> {
     for approval in approvals {
         *counts.entry(approval.state).or_insert(0usize) += 1;
     }
-    println!("version: 0.7.0");
+    let inventory_ready = !p.require_known_tools || inventory_fresh(p);
+    println!("version: 1.0.4");
     println!("command: {}", p.command);
     println!("audit_exists: {}", p.audit_path.exists());
     println!(
@@ -817,6 +865,14 @@ fn status(p: &Policy) -> Result<(), String> {
     println!("json_schemas: {}", p.tool_schemas.len());
     println!("inventory: {}", inventory_path(p).display());
     println!("inventory_fresh: {}", inventory_fresh(p));
+    println!(
+        "readiness: {}",
+        if inventory_ready {
+            "healthy"
+        } else {
+            "degraded"
+        }
+    );
     println!(
         "limits: request_bytes={} argument_bytes={} calls_per_minute={}",
         p.max_request_bytes, p.max_argument_bytes, p.max_calls_per_minute
@@ -1579,7 +1635,23 @@ mod tests {
             &root.join("escape/passwd").display().to_string(),
             &[root.display().to_string()]
         ));
+        assert!(!path_allowed(
+            "../../etc/passwd",
+            &[root.display().to_string()]
+        ));
+        assert!(!path_allowed(
+            &format!("{}-private/file", root.display()),
+            &[root.display().to_string()]
+        ));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_security_configuration_is_rejected() {
+        let result: Result<Config, _> = toml::from_str(
+            "[server.fixture]\ncommand = \"/bin/true\"\nseccomp_deny_dangerousg = true\n",
+        );
+        assert!(result.is_err());
     }
 
     #[cfg(unix)]

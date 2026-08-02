@@ -113,7 +113,9 @@ Never delete the audit or approval queue during a routine upgrade. Preserve them
 ## Known limits
 
 - Stdio JSON-RPC only; no network transport or TLS.
-- Path checks are lexical and do not resolve symlinks.
+- When `allowed_roots` is configured, path arguments must be absolute. Existing paths are canonicalized before component-aware root containment is checked; lexical fallback is used only for non-existent final paths.
+- This is policy validation, not a race-free filesystem boundary. Use mount hardening or a stronger outer sandbox for untrusted file access.
+- Inventory uses the configured sandbox launcher and a bounded timeout. With `sandbox.timeout_seconds = 0`, inventory uses a 30-second safety timeout.
 - Inventory is a capability snapshot, not JSON Schema authorization.
 - A compromised host, root user, or compromised child process can bypass this user-space boundary.
 - The default release binary is dynamically linked to glibc.
