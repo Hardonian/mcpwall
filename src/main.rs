@@ -53,6 +53,8 @@ struct Policy {
     #[serde(default)]
     require_known_tools: bool,
     #[serde(default)]
+    production_mode: bool,
+    #[serde(default)]
     tool_policies: BTreeMap<String, ToolPolicy>,
     #[serde(default)]
     tool_schemas: BTreeMap<String, PathBuf>,
@@ -167,6 +169,27 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
             *schema_path = config_dir.join(&*schema_path);
         }
     }
+    if policy.production_mode {
+        if !policy.sandbox.enabled {
+            return Err("production_mode requires sandbox.enabled = true".into());
+        }
+        if policy.sandbox.run_as_uid.is_none() || policy.sandbox.run_as_gid.is_none() {
+            return Err("production_mode requires sandbox.run_as_uid and run_as_gid".into());
+        }
+        if policy.allowed_tools.is_empty() {
+            return Err("production_mode requires a non-empty allowed_tools list".into());
+        }
+        if policy.sandbox.timeout_seconds == 0 {
+            return Err("production_mode requires sandbox.timeout_seconds > 0".into());
+        }
+        let has_path_policy = policy
+            .tool_policies
+            .values()
+            .any(|rule| !rule.path_arguments.is_empty());
+        if has_path_policy && policy.allowed_roots.is_empty() {
+            return Err("production_mode path policies require non-empty allowed_roots".into());
+        }
+    }
     validate_schema_files(&policy)?;
     validate_sandbox_policy(&policy.sandbox)?;
     Ok(policy)
@@ -268,25 +291,33 @@ fn json_string_fields(line: &str) -> Vec<String> {
     out
 }
 
-fn named_values(line: &str, field: &str) -> Vec<String> {
-    let needle = format!("\"{field}\"");
-    let mut values = Vec::new();
-    let mut from = 0;
-    while let Some(rel) = line[from..].find(&needle) {
-        let pos = from + rel;
-        let rest = line[pos + needle.len()..].trim_start();
-        let Some(rest) = rest.strip_prefix(':').map(str::trim_start) else {
-            from = pos + needle.len();
-            continue;
-        };
-        let Some(end) = rest.strip_prefix('"').and_then(|x| x.find('"')) else {
-            from = pos + needle.len();
-            continue;
-        };
-        values.push(rest[1..=end].to_owned());
-        from = pos + needle.len();
+fn inventory_tool_names(response: &str) -> Result<Vec<String>, String> {
+    if response.len() > 1_048_576 {
+        return Err("inventory response exceeds 1 MiB".into());
     }
-    values
+    let value: Value = serde_json::from_str(response)
+        .map_err(|e| format!("invalid inventory JSON-RPC response: {e}"))?;
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || value.get("id").and_then(Value::as_i64) != Some(1)
+    {
+        return Err("inventory response has invalid JSON-RPC version or id".into());
+    }
+    let tools = value
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .ok_or("inventory response missing result.tools array")?;
+    let mut names = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("inventory tool missing string name")?;
+        if name.is_empty() || name.len() > 256 {
+            return Err("inventory tool name is empty or too long".into());
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
 }
 
 fn redact(mut line: String, patterns: &[String]) -> String {
@@ -621,7 +652,7 @@ fn inventory(p: &Policy) -> Result<(), String> {
         let _ = child.wait();
         return Err("child exited without tools/list response".into());
     }
-    let mut names = named_values(&response, "name");
+    let mut names = inventory_tool_names(&response)?;
     names.sort();
     names.dedup();
     kill_process_group(&mut child);
@@ -1046,18 +1077,34 @@ fn install_seccomp_deny_filter() -> io::Result<()> {
 fn apply_uid_gid(uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     match (uid, gid) {
         (Some(uid), Some(gid)) => unsafe {
-            let current_uid = libc::geteuid();
-            let current_gid = libc::getegid();
-            let group_change = current_gid != gid as libc::gid_t;
-            let uid_change = current_uid != uid as libc::uid_t;
-            let groups_ok = !group_change || libc::setgroups(0, std::ptr::null()) == 0;
-            let gid_ok = !group_change || libc::setgid(gid as libc::gid_t) == 0;
-            let uid_ok = !uid_change || libc::setuid(uid as libc::uid_t) == 0;
-            if groups_ok && gid_ok && uid_ok {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
+            let target_uid = uid as libc::uid_t;
+            let target_gid = gid as libc::gid_t;
+            let uid_change = libc::getuid() != target_uid || libc::geteuid() != target_uid;
+            let gid_change = libc::getgid() != target_gid || libc::getegid() != target_gid;
+            if !uid_change && !gid_change {
+                return Ok(());
             }
+            if libc::setgroups(0, std::ptr::null()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setresgid(target_gid, target_gid, target_gid) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setresuid(target_uid, target_uid, target_uid) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getuid() != target_uid
+                || libc::geteuid() != target_uid
+                || libc::getgid() != target_gid
+                || libc::getegid() != target_gid
+                || libc::getgroups(0, std::ptr::null_mut()) != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "UID/GID transition verification failed",
+                ));
+            }
+            Ok(())
         },
         (None, None) => Ok(()),
         _ => Err(io::Error::new(
@@ -1644,6 +1691,17 @@ mod tests {
             &[root.display().to_string()]
         ));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inventory_response_requires_structured_json_rpc_tools() {
+        let valid = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_file"}]}}"#;
+        assert_eq!(inventory_tool_names(valid).unwrap(), vec!["read_file"]);
+        assert!(inventory_tool_names(r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#).is_err());
+        assert!(
+            inventory_tool_names(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":3}]}}"#)
+                .is_err()
+        );
     }
 
     #[test]
