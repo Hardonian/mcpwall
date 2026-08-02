@@ -47,6 +47,8 @@ struct Policy {
     require_known_tools: bool,
     #[serde(default)]
     tool_policies: BTreeMap<String, ToolPolicy>,
+    #[serde(default)]
+    tool_schemas: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -84,7 +86,7 @@ struct Config {
 
 fn usage() {
     println!(
-        "mcpwall 0.6.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 0.7.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -112,7 +114,40 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
     if policy.audit_path.as_os_str().is_empty() {
         policy.audit_path = default_audit_path();
     }
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    for schema_path in policy.tool_schemas.values_mut() {
+        if schema_path.is_relative() {
+            *schema_path = config_dir.join(&*schema_path);
+        }
+    }
+    validate_schema_files(&policy)?;
     Ok(policy)
+}
+
+fn validate_schema_files(p: &Policy) -> Result<(), String> {
+    for (tool, path) in &p.tool_schemas {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| format!("read JSON Schema for {tool} ({}): {e}", path.display()))?;
+        let schema: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("parse JSON Schema for {tool} ({}): {e}", path.display()))?;
+        jsonschema::validator_for(&schema)
+            .map_err(|e| format!("compile JSON Schema for {tool} ({}): {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn load_schema_validators(p: &Policy) -> Result<BTreeMap<String, jsonschema::Validator>, String> {
+    let mut validators = BTreeMap::new();
+    for (tool, path) in &p.tool_schemas {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| format!("read JSON Schema for {tool} ({}): {e}", path.display()))?;
+        let schema: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("parse JSON Schema for {tool} ({}): {e}", path.display()))?;
+        let validator = jsonschema::validator_for(&schema)
+            .map_err(|e| format!("compile JSON Schema for {tool} ({}): {e}", path.display()))?;
+        validators.insert(tool.clone(), validator);
+    }
+    Ok(validators)
 }
 
 fn json_string_fields(line: &str) -> Vec<String> {
@@ -505,11 +540,50 @@ fn inventory_fresh(p: &Policy) -> bool {
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|age| age.as_secs() <= p.inventory_max_age_seconds)
 }
+fn path_allowed(value: &str, roots: &[String]) -> bool {
+    if roots.is_empty() || !value.starts_with('/') {
+        return true;
+    }
+    let candidate = normalized_path(Path::new(value));
+    roots.iter().any(|root| {
+        let root = normalized_path(Path::new(root));
+        candidate == root || candidate.starts_with(root)
+    })
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn parse_request(line: &str, max_bytes: usize) -> Result<Value, String> {
     if line.len() > max_bytes {
         return Err(format!("request exceeds max_request_bytes={max_bytes}"));
     }
-    serde_json::from_str(line).map_err(|e| format!("invalid JSON-RPC request: {e}"))
+    let value: Value =
+        serde_json::from_str(line).map_err(|e| format!("invalid JSON-RPC request: {e}"))?;
+    if !value.is_object() {
+        return Err("JSON-RPC batch requests and scalar values are not supported".into());
+    }
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err("JSON-RPC version must be \"2.0\"".into());
+    }
+    if value.get("method").and_then(Value::as_str).is_none() {
+        return Err("JSON-RPC method is required".into());
+    }
+    Ok(value)
 }
 fn request_method(request: &Value) -> String {
     request
@@ -572,6 +646,19 @@ fn argument_violation(value: &Value, p: &Policy) -> Option<String> {
     walk(args, p)
 }
 
+fn json_schema_violation(
+    request: &Value,
+    tool: &str,
+    validators: &BTreeMap<String, jsonschema::Validator>,
+) -> Option<String> {
+    let validator = validators.get(tool)?;
+    let arguments = request.pointer("/params/arguments").unwrap_or(&Value::Null);
+    validator
+        .validate(arguments)
+        .err()
+        .map(|error| format!("JSON Schema validation failed for {tool}: {error}"))
+}
+
 fn tool_schema_violation(request: &Value, tool: &str, p: &Policy) -> Option<String> {
     let rule = p.tool_policies.get(tool)?;
     let args = request
@@ -620,12 +707,7 @@ fn tool_schema_violation(request: &Value, tool: &str, p: &Policy) -> Option<Stri
         let Some(value) = args.get(key).and_then(Value::as_str) else {
             return Some(format!("path argument must be a string: {key}"));
         };
-        if !p.allowed_roots.is_empty()
-            && !p
-                .allowed_roots
-                .iter()
-                .any(|root| value == root || value.starts_with(&(root.clone() + "/")))
-        {
+        if !path_allowed(value, &p.allowed_roots) {
             return Some(format!("path argument denied: {key}"));
         }
     }
@@ -638,7 +720,7 @@ fn status(p: &Policy) -> Result<(), String> {
     for approval in approvals {
         *counts.entry(approval.state).or_insert(0usize) += 1;
     }
-    println!("version: 0.6.0");
+    println!("version: 0.7.0");
     println!("command: {}", p.command);
     println!("audit_exists: {}", p.audit_path.exists());
     println!(
@@ -647,6 +729,7 @@ fn status(p: &Policy) -> Result<(), String> {
     );
     println!("approval_queue: {}", approval_path(p).display());
     println!("approval_counts: {:?}", counts);
+    println!("json_schemas: {}", p.tool_schemas.len());
     println!("inventory: {}", inventory_path(p).display());
     println!("inventory_fresh: {}", inventory_fresh(p));
     println!(
@@ -676,6 +759,7 @@ fn doctor(p: &Policy) -> Result<(), String> {
     }
     println!("approval rules: {}", p.require_approval.len());
     println!("approval ttl: {}s", p.approval_ttl_seconds);
+    println!("json schemas: {}", p.tool_schemas.len());
     if p.require_known_tools {
         let path = inventory_path(p);
         if !path.exists() {
@@ -695,6 +779,7 @@ fn doctor(p: &Policy) -> Result<(), String> {
 }
 
 fn proxy(p: &Policy) -> Result<(), String> {
+    let validators = load_schema_validators(p)?;
     let mut child = Command::new(&p.command)
         .args(&p.args)
         .stdin(Stdio::piped())
@@ -754,6 +839,17 @@ fn proxy(p: &Policy) -> Result<(), String> {
         }
         calls.push_back(ts);
         if let Some(t) = &tool {
+            if let Some(reason) = json_schema_violation(&request, t, &validators) {
+                let out = error_response(&id, &reason);
+                println!("{out}");
+                audit(
+                    &p.audit_path,
+                    &format!(r#"{{"event":"deny","reason":"json_schema","tool":"{t}","id":{id}}}"#),
+                    &p.redact_patterns,
+                )
+                .map_err(|e| e.to_string())?;
+                continue;
+            }
             if let Some(reason) = tool_schema_violation(&request, t, p) {
                 let out = error_response(&id, &reason);
                 println!("{out}");
@@ -800,12 +896,7 @@ fn proxy(p: &Policy) -> Result<(), String> {
                 .into_iter()
                 .filter(|x| x.starts_with('/'))
             {
-                if !p.allowed_roots.is_empty()
-                    && !p
-                        .allowed_roots
-                        .iter()
-                        .any(|root| value == *root || value.starts_with(&(root.clone() + "/")))
-                {
+                if !path_allowed(&value, &p.allowed_roots) {
                     path_denied = true;
                     break;
                 }
@@ -998,6 +1089,56 @@ mod tests {
                 .contains("path argument denied")
         );
     }
+    #[test]
+    fn arbitrary_json_schema_enforces_nested_required_enum_and_pattern() {
+        let schema: Value = serde_json::json!({
+            "type": "object",
+            "required": ["path", "mode"],
+            "properties": {
+                "path": {"$ref": "#/$defs/path"},
+                "mode": {"enum": ["read", "metadata"]},
+                "options": {
+                    "type": "object",
+                    "required": ["recursive"],
+                    "properties": {"recursive": {"type": "boolean"}}
+                }
+            },
+            "$defs": {
+                "path": {"type": "string", "pattern": "^/home/scott/projects/"}
+            },
+            "additionalProperties": false
+        });
+        let mut validators = BTreeMap::new();
+        validators.insert(
+            "read_file".into(),
+            jsonschema::validator_for(&schema).unwrap(),
+        );
+        let valid: Value = serde_json::json!({"params":{"arguments":{"path":"/home/scott/projects/a","mode":"read","options":{"recursive":false}}}});
+        assert_eq!(
+            json_schema_violation(&valid, "read_file", &validators),
+            None
+        );
+        let invalid: Value = serde_json::json!({"params":{"arguments":{"path":"/etc/passwd","mode":"write","extra":true}}});
+        assert!(
+            json_schema_violation(&invalid, "read_file", &validators)
+                .unwrap()
+                .contains("JSON Schema validation failed")
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_resolves_symlinked_parents() {
+        let root = PathBuf::from("/tmp/mcpwall-path-policy-test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("/etc", root.join("escape")).unwrap();
+        assert!(!path_allowed(
+            &root.join("escape/passwd").display().to_string(),
+            &[root.display().to_string()]
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn malformed_and_oversized_requests_fail_closed() {
         assert!(parse_request("not-json", 100).is_err());

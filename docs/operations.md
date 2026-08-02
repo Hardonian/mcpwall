@@ -23,9 +23,12 @@ mcpwall status --config "$HOME/.config/mcpwall/filesystem.toml" --server filesys
 
 Enable `require_known_tools = true` only after the inventory has been captured. Set `inventory_max_age_seconds` so a changed or stale server capability set fails closed.
 
-For high-risk tools, add a per-tool schema:
+For high-risk tools, add a per-tool compatibility rule or a full JSON Schema file:
 
 ```toml
+# Paths are relative to the policy file.
+tool_schemas = { read_file = "schemas/read_file.json" }
+
 [server.filesystem.tool_policies.read_file]
 allowed_arguments = ["path"]
 required_arguments = ["path"]
@@ -33,7 +36,7 @@ argument_types = { path = "string" }
 path_arguments = ["path"]
 ```
 
-Schema enforcement runs before generic argument and path policy. The release manifest and `SHA256SUMS` must be distributed with the binary; the manifest is integrity metadata, not a signature.
+Full JSON Schemas are compiled before the child starts and can use nested properties, arrays, `$ref`, enums, combinators, conditional rules, and `additionalProperties`. Network resolution is disabled; keep schemas local. Schema enforcement runs before generic argument and path policy. The release manifest and `SHA256SUMS` must be distributed with the binary; the manifest is integrity metadata, not a signature.
 
 ## Runtime pattern
 

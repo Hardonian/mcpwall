@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "read_file.json",
+  "title": "read_file arguments",
+  "type": "object",
+  "required": ["path"],
+  "properties": {
+    "path": {
+      "type": "string",
+      "pattern": "^/home/scott/projects/"
+    }
+  },
+  "additionalProperties": false
+}

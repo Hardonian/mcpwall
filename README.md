@@ -28,11 +28,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-The release binary is `target/release/mcpwall` (currently v0.6.0).
+The release binary is `target/release/mcpwall` (currently v0.7.0).
 
 ## Configure
 
-Copy `mcpwall.example.toml` and change the server command, arguments, roots, and audit path. The parser intentionally supports the small policy subset used by mcpwall; it is not a general TOML implementation.
+Copy `mcpwall.example.toml` and change the server command, arguments, roots, schema files, and audit path. The policy file is parsed as TOML. JSON Schema files are parsed and compiled at startup; missing, malformed, or unsupported schemas fail closed before the child starts.
 
 ```sh
 cp mcpwall.example.toml /tmp/mcpwall.toml
@@ -116,19 +116,17 @@ Operational status:
 
 The policy file is now parsed by the TOML library rather than the former line parser. Quoted `#` characters, escaped strings, inline arrays, and malformed TOML are handled by the parser. Unknown or malformed configuration is rejected before the child server starts.
 
-## v0.6 per-tool schemas and release provenance
+## v0.7 full JSON Schema enforcement
 
-Per-tool policies can require and restrict argument fields, enforce JSON value types, and designate path arguments:
+Each tool can reference an external JSON Schema file:
 
 ```toml
-[server.filesystem.tool_policies.read_file]
-allowed_arguments = ["path"]
-required_arguments = ["path"]
-argument_types = { path = "string" }
-path_arguments = ["path"]
+tool_schemas = { read_file = "schemas/read_file.json" }
 ```
 
-Schema violations are denied before the generic argument and path controls. Supported types are `string`, `boolean`, `number`, `integer`, `object`, `array`, and `null`.
+Schema paths are resolved relative to the policy file. mcpwall compiles every configured schema before starting the child and rejects the entire configuration if a schema is missing, malformed, or invalid. The validator supports standard JSON Schema drafts and arbitrary nested constraints, including `$ref`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`, numeric/string limits, patterns, `oneOf`, `anyOf`, `allOf`, `not`, and conditional schemas supported by the validator. Network schema resolution is intentionally disabled; use local files for sovereign operation.
+
+Validation applies to the exact `params.arguments` value before legacy typed rules, denied-argument scanning, path checks, approval gates, and forwarding. Schema failures are written to the audit log with `reason: "json_schema"` without persisting the rejected request in the denial event.
 
 Tagged releases generate:
 
@@ -142,9 +140,9 @@ The manifest is integrity metadata, not a cryptographic signature. GitHub Action
 
 - Bind the MCP client and server to the same user account or use filesystem permissions around the proxy and audit files.
 - Keep the audit file outside shared or web-served directories.
-- Path checks are lexical in v0.4; they do not resolve symlinks. Do not treat them as a complete filesystem sandbox.
+- Path checks canonicalize existing files and symlinked parents, then normalize non-existent paths; they are still not a complete filesystem sandbox.
 - There is no TLS because stdio is local. For network transport, use a separately authenticated local gateway.
-- The policy parser is deliberately narrow. Invalid or missing policy values fail closed.
+- TOML policy parsing and JSON Schema compilation fail closed on invalid or missing values.
 - Approval records bind the JSON-RPC request ID and SHA-256 request hash; clients should use unique request IDs for approval-gated calls.
 
 ## Development fixture
