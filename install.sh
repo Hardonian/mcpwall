@@ -20,6 +20,7 @@ else
   asset="$NAME-linux-x86_64-gnu"
   curl -fsSL "$BASE/$asset" -o "$tmpdir/$asset"
   curl -fsSL "$BASE/RELEASE-MANIFEST.json" -o "$tmpdir/RELEASE-MANIFEST.json"
+  curl -fsSL "$BASE/DEPENDENCY-METADATA.json" -o "$tmpdir/DEPENDENCY-METADATA.json"
   curl -fsSL "$BASE/SHA256SUMS" -o "$tmpdir/SHA256SUMS"
   (cd "$tmpdir" && sha256sum -c SHA256SUMS)
   install -d "$PREFIX/bin"
