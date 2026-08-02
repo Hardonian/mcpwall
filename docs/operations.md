@@ -62,6 +62,29 @@ stat -c '%a %n' AUDIT_PATH AUDIT_PATH.approvals.tsv
 
 Expected private artifact permissions on Linux are `600` for audit and approval files.
 
+## Optional Linux sandbox
+
+Enable the sandbox per server only after testing the child’s requirements:
+
+```toml
+[server.filesystem.sandbox]
+enabled = true
+clear_environment = true
+environment_allowlist = ["PATH", "HOME", "LANG"]
+working_dir = "/home/scott/projects"
+timeout_seconds = 120
+max_memory_bytes = 1073741824
+max_cpu_seconds = 60
+max_file_bytes = 104857600
+max_open_files = 256
+max_processes = 0
+network_namespace = false
+```
+
+Verify with `doctor`, then run a representative request. The launcher sets `NoNewPrivileges`, creates a dedicated process group, applies configured Unix resource limits, and kills the entire process group on timeout. `max_processes` is a Linux per-user/thread limit rather than a child-only limit; keep it disabled unless the host-wide consequence is understood. `network_namespace = true` requires the host to permit `unshare(CLONE_NEWNET)` and fails closed otherwise.
+
+Sandbox controls do not provide mount namespaces, seccomp, UID remapping, or protection against a privileged host attacker. Treat them as a process-hardening layer, not a complete container replacement.
+
 ## Upgrade and rollback
 
 Before upgrading, copy the policy file and record the current version:

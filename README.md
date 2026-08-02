@@ -28,7 +28,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-The release binary is `target/release/mcpwall` (currently v0.7.0).
+The release binary is `target/release/mcpwall` (currently v0.8.0).
 
 ## Configure
 
@@ -115,6 +115,41 @@ Operational status:
 ## v0.5 configuration hardening
 
 The policy file is now parsed by the TOML library rather than the former line parser. Quoted `#` characters, escaped strings, inline arrays, and malformed TOML are handled by the parser. Unknown or malformed configuration is rejected before the child server starts.
+
+## v0.8 Linux sandboxed launcher
+
+The optional per-server sandbox adds real child-process controls on Unix/Linux:
+
+```toml
+[server.filesystem.sandbox]
+enabled = true
+clear_environment = true
+environment_allowlist = ["PATH", "HOME", "LANG"]
+working_dir = "/home/scott/projects"
+timeout_seconds = 120
+max_memory_bytes = 1073741824
+max_cpu_seconds = 60
+max_file_bytes = 104857600
+max_open_files = 256
+# Linux per-user/thread limit; leave 0 unless you understand host-wide semantics.
+max_processes = 0
+network_namespace = false
+```
+
+When enabled, mcpwall:
+
+- Creates a dedicated process group/session
+- Sets Linux `PR_SET_NO_NEW_PRIVS`
+- Applies `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, and optional `RLIMIT_NPROC`
+- Clears inherited environment variables when configured
+- Re-adds only explicitly allowlisted variables
+- Enforces a wall-clock timeout and kills the entire child process group
+- Validates the working directory before startup
+- Can request a separate network namespace with `network_namespace = true`; if the host denies `unshare`, startup fails closed
+
+`max_processes` is deliberately opt-in because Linux applies `RLIMIT_NPROC` to the user’s processes/threads, not only this child. A value that is too low can prevent otherwise-valid subprocesses from starting or affect unrelated same-user workloads.
+
+This is meaningful process hardening, but it is not equivalent to a container or complete kernel sandbox. It does not provide mount isolation, seccomp policy generation, user-ID remapping, or protection from a privileged host attacker.
 
 ## v0.7 full JSON Schema enforcement
 

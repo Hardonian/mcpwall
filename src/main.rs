@@ -8,8 +8,13 @@ use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize, Clone, Default)]
 struct Policy {
@@ -49,6 +54,33 @@ struct Policy {
     tool_policies: BTreeMap<String, ToolPolicy>,
     #[serde(default)]
     tool_schemas: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    sandbox: SandboxPolicy,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct SandboxPolicy {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    clear_environment: bool,
+    #[serde(default)]
+    environment_allowlist: Vec<String>,
+    working_dir: Option<PathBuf>,
+    #[serde(default)]
+    timeout_seconds: u64,
+    #[serde(default)]
+    max_memory_bytes: u64,
+    #[serde(default)]
+    max_cpu_seconds: u64,
+    #[serde(default)]
+    max_file_bytes: u64,
+    #[serde(default)]
+    max_open_files: u64,
+    #[serde(default)]
+    max_processes: u64,
+    #[serde(default)]
+    network_namespace: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -86,7 +118,7 @@ struct Config {
 
 fn usage() {
     println!(
-        "mcpwall 0.7.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 0.8.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -121,7 +153,29 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
         }
     }
     validate_schema_files(&policy)?;
+    validate_sandbox_policy(&policy.sandbox)?;
     Ok(policy)
+}
+
+fn validate_sandbox_policy(sandbox: &SandboxPolicy) -> Result<(), String> {
+    if !sandbox.enabled {
+        return Ok(());
+    }
+    if !sandbox.environment_allowlist.is_empty() && !sandbox.clear_environment {
+        return Err("sandbox.environment_allowlist requires clear_environment = true".into());
+    }
+    if sandbox
+        .working_dir
+        .as_ref()
+        .is_some_and(|dir| !dir.is_dir())
+    {
+        let dir = sandbox.working_dir.as_ref().expect("checked above");
+        return Err(format!(
+            "sandbox working_dir is not a directory: {}",
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_schema_files(p: &Policy) -> Result<(), String> {
@@ -759,6 +813,10 @@ fn doctor(p: &Policy) -> Result<(), String> {
     }
     println!("approval rules: {}", p.require_approval.len());
     println!("approval ttl: {}s", p.approval_ttl_seconds);
+    println!(
+        "sandbox: enabled={} timeout_seconds={} network_namespace={}",
+        p.sandbox.enabled, p.sandbox.timeout_seconds, p.sandbox.network_namespace
+    );
     println!("json schemas: {}", p.tool_schemas.len());
     if p.require_known_tools {
         let path = inventory_path(p);
@@ -778,15 +836,123 @@ fn doctor(p: &Policy) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn apply_sandbox(command: &mut Command, sandbox: &SandboxPolicy) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+
+    if !sandbox.enabled {
+        return Ok(());
+    }
+    let allowlist = sandbox.environment_allowlist.clone();
+    if sandbox.clear_environment {
+        let inherited: Vec<(String, String)> = env::vars()
+            .filter(|(key, _)| allowlist.iter().any(|allowed| allowed == key))
+            .collect();
+        command.env_clear().envs(inherited);
+    } else if !allowlist.is_empty() {
+        return Err("sandbox.environment_allowlist requires clear_environment = true".into());
+    }
+    if let Some(dir) = &sandbox.working_dir {
+        if !dir.is_dir() {
+            return Err(format!(
+                "sandbox working_dir is not a directory: {}",
+                dir.display()
+            ));
+        }
+        command.current_dir(dir);
+    }
+    let limits = sandbox.clone();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if limits.network_namespace && libc::unshare(libc::CLONE_NEWNET) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            set_limit(libc::RLIMIT_AS, limits.max_memory_bytes)?;
+            set_limit(libc::RLIMIT_CPU, limits.max_cpu_seconds)?;
+            set_limit(libc::RLIMIT_FSIZE, limits.max_file_bytes)?;
+            set_limit(libc::RLIMIT_NOFILE, limits.max_open_files)?;
+            set_limit(libc::RLIMIT_NPROC, limits.max_processes)?;
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_limit(resource: libc::__rlimit_resource_t, value: u64) -> io::Result<()> {
+    if value == 0 {
+        return Ok(());
+    }
+    let limit = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    if unsafe { libc::setrlimit(resource, &limit) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_sandbox(_command: &mut Command, sandbox: &SandboxPolicy) -> Result<(), String> {
+    if sandbox.enabled {
+        Err("sandbox mode is only implemented on Unix hosts".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn kill_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pid = child.id() as libc::pid_t;
+        let _ = libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+fn arm_timeout(pid: u32, seconds: u64) -> (Arc<AtomicBool>, Option<thread::JoinHandle<()>>) {
+    let done = Arc::new(AtomicBool::new(false));
+    if seconds == 0 {
+        return (done, None);
+    }
+    let finished = Arc::clone(&done);
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(seconds));
+        if !finished.load(Ordering::SeqCst) {
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    });
+    (done, Some(handle))
+}
+
 fn proxy(p: &Policy) -> Result<(), String> {
     let validators = load_schema_validators(p)?;
-    let mut child = Command::new(&p.command)
-        .args(&p.args)
+    let mut command = Command::new(&p.command);
+    command.args(&p.args);
+    apply_sandbox(&mut command, &p.sandbox)?;
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", p.command))?;
+    let timeout_seconds = if p.sandbox.enabled {
+        p.sandbox.timeout_seconds
+    } else {
+        0
+    };
+    let (finished, watchdog) = arm_timeout(child.id(), timeout_seconds);
     let mut child_in = child.stdin.take().ok_or("child stdin unavailable")?;
     let child_out = child.stdout.take().ok_or("child stdout unavailable")?;
     let mut child_out = BufReader::new(child_out);
@@ -940,13 +1106,26 @@ fn proxy(p: &Policy) -> Result<(), String> {
             .read_line(&mut response)
             .map_err(|e| e.to_string())?;
         if response.is_empty() {
-            return Err("child exited without a JSON-RPC response".into());
+            let timed_out = !finished.swap(true, Ordering::SeqCst);
+            kill_process_group(&mut child);
+            if let Some(handle) = watchdog {
+                let _ = handle.join();
+            }
+            return Err(if timed_out && p.sandbox.timeout_seconds > 0 {
+                "child process timed out".into()
+            } else {
+                "child exited without a JSON-RPC response".into()
+            });
         }
         print!("{response}");
         io::stdout().flush().map_err(|e| e.to_string())?;
         audit(&p.audit_path, &format!(r#"{{"event":"forward","method":"{method}","tool":{},"id":{id},"request":{line},"response":{}}}"#, tool.map(|x| format!("\"{x}\"")).unwrap_or_else(|| "null".into()), response.trim_end()), &p.redact_patterns).map_err(|e| e.to_string())?;
     }
-    let _ = child.kill();
+    finished.store(true, Ordering::SeqCst);
+    kill_process_group(&mut child);
+    if let Some(handle) = watchdog {
+        let _ = handle.join();
+    }
     Ok(())
 }
 
@@ -1137,6 +1316,22 @@ mod tests {
             &[root.display().to_string()]
         ));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_rejects_allowlist_without_environment_clear() {
+        let mut command = Command::new("/bin/true");
+        let sandbox = SandboxPolicy {
+            enabled: true,
+            environment_allowlist: vec!["PATH".into()],
+            ..SandboxPolicy::default()
+        };
+        assert!(
+            apply_sandbox(&mut command, &sandbox)
+                .unwrap_err()
+                .contains("clear_environment")
+        );
     }
 
     #[test]

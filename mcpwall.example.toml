@@ -1,4 +1,4 @@
-# mcpwall v0.1 policy. One server section is selected with --server.
+# mcpwall v0.8 policy. One server section is selected with --server.
 [server.filesystem]
 command = "/usr/local/bin/mcp-filesystem"
 args = ["/home/scott/projects"]
@@ -18,6 +18,20 @@ inventory_path = "/tmp/mcpwall-filesystem.tools"
 # Optional full JSON Schema files. Paths are resolved relative to this policy file.
 # tool_schemas = { read_file = "schemas/read_file.json" }
 audit_path = "/tmp/mcpwall-filesystem.jsonl"
+
+# Optional Linux child sandbox. Disabled by default for backward compatibility.
+# [server.filesystem.sandbox]
+# enabled = true
+# clear_environment = true
+# environment_allowlist = ["PATH", "HOME", "LANG"]
+# working_dir = "/home/scott/projects"
+# timeout_seconds = 120
+# max_memory_bytes = 1073741824
+# max_cpu_seconds = 60
+# max_file_bytes = 104857600
+# max_open_files = 256
+# max_processes = 64
+# network_namespace = false
 
 [server.filesystem.tool_policies.read_file]
 allowed_arguments = ["path"]

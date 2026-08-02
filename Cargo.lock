@@ -441,9 +441,10 @@ dependencies = [
 
 [[package]]
 name = "mcpwall"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
