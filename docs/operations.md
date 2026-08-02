@@ -79,11 +79,15 @@ max_file_bytes = 104857600
 max_open_files = 256
 max_processes = 0
 network_namespace = false
+seccomp_deny_dangerous = true
+# Optional identity drop; different UID/GID requires a privileged launcher.
+# run_as_uid = 65534
+# run_as_gid = 65534
 ```
 
-Verify with `doctor`, then run a representative request. The launcher sets `NoNewPrivileges`, creates a dedicated process group, applies configured Unix resource limits, and kills the entire process group on timeout. `max_processes` is a Linux per-user/thread limit rather than a child-only limit; keep it disabled unless the host-wide consequence is understood. `network_namespace = true` requires the host to permit `unshare(CLONE_NEWNET)` and fails closed otherwise.
+Verify with `doctor`, then run a representative request. The launcher sets `NoNewPrivileges`, creates a dedicated process group, applies configured Unix resource limits, and kills the entire process group on timeout. `seccomp_deny_dangerous` installs a Linux x86_64 deny filter for selected high-risk kernel interfaces and returns `EPERM`; it is not a complete syscall allowlist. `run_as_uid` and `run_as_gid` must be supplied together, cannot target root, and fail closed if the parent lacks permission to change identity. `max_processes` is a Linux per-user/thread limit rather than a child-only limit; keep it disabled unless the host-wide consequence is understood. `network_namespace = true` requires the host to permit `unshare(CLONE_NEWNET)` and fails closed otherwise.
 
-Sandbox controls do not provide mount namespaces, seccomp, UID remapping, or protection against a privileged host attacker. Treat them as a process-hardening layer, not a complete container replacement.
+Sandbox controls do not provide mount namespaces, automatic UID remapping, or protection against a privileged host attacker. Treat them as a process-hardening layer, not a complete container replacement.
 
 ## Upgrade and rollback
 

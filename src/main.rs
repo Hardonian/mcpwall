@@ -81,6 +81,10 @@ struct SandboxPolicy {
     max_processes: u64,
     #[serde(default)]
     network_namespace: bool,
+    #[serde(default)]
+    seccomp_deny_dangerous: bool,
+    run_as_uid: Option<u32>,
+    run_as_gid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -118,7 +122,7 @@ struct Config {
 
 fn usage() {
     println!(
-        "mcpwall 0.8.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 0.9.0 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -158,6 +162,12 @@ fn load_policy(path: &Path, server: &str) -> Result<Policy, String> {
 }
 
 fn validate_sandbox_policy(sandbox: &SandboxPolicy) -> Result<(), String> {
+    if sandbox.run_as_uid.is_some() != sandbox.run_as_gid.is_some() {
+        return Err("sandbox.run_as_uid and run_as_gid must be provided together".into());
+    }
+    if sandbox.run_as_uid == Some(0) {
+        return Err("sandbox.run_as_uid must not be root (0)".into());
+    }
     if !sandbox.enabled {
         return Ok(());
     }
@@ -814,8 +824,13 @@ fn doctor(p: &Policy) -> Result<(), String> {
     println!("approval rules: {}", p.require_approval.len());
     println!("approval ttl: {}s", p.approval_ttl_seconds);
     println!(
-        "sandbox: enabled={} timeout_seconds={} network_namespace={}",
-        p.sandbox.enabled, p.sandbox.timeout_seconds, p.sandbox.network_namespace
+        "sandbox: enabled={} timeout_seconds={} network_namespace={} seccomp_deny_dangerous={} run_as_uid={:?} run_as_gid={:?}",
+        p.sandbox.enabled,
+        p.sandbox.timeout_seconds,
+        p.sandbox.network_namespace,
+        p.sandbox.seccomp_deny_dangerous,
+        p.sandbox.run_as_uid,
+        p.sandbox.run_as_gid
     );
     println!("json schemas: {}", p.tool_schemas.len());
     if p.require_known_tools {
@@ -834,6 +849,142 @@ fn doctor(p: &Policy) -> Result<(), String> {
     println!("audit: {}", p.audit_path.display());
     println!("status: healthy");
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn install_seccomp_deny_filter() -> io::Result<()> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JA: u16 = 0x05;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000;
+    const SECCOMP_RET_ERRNO: u32 = 0x00050000;
+    const SECCOMP_SET_MODE_FILTER: libc::c_int = 1;
+    const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
+    const SECCOMP_DATA_NR: u32 = 0;
+    const SECCOMP_DATA_ARCH: u32 = 4;
+    let denied = [
+        libc::SYS_ptrace,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_setns,
+        libc::SYS_unshare,
+        libc::SYS_reboot,
+        libc::SYS_kexec_load,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_keyctl,
+        libc::SYS_userfaultfd,
+        libc::SYS_io_uring_setup,
+    ];
+    let mut filter = Vec::with_capacity(4 + denied.len() * 2);
+    filter.push(libc::sock_filter {
+        code: BPF_LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_DATA_ARCH,
+    });
+    filter.push(libc::sock_filter {
+        code: BPF_JMP_JEQ_K,
+        jt: 1,
+        jf: 0,
+        k: AUDIT_ARCH_X86_64,
+    });
+    filter.push(libc::sock_filter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_KILL_PROCESS,
+    });
+    filter.push(libc::sock_filter {
+        code: BPF_LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_DATA_NR,
+    });
+    for syscall_nr in denied {
+        filter.push(libc::sock_filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: syscall_nr as u32,
+        });
+        filter.push(libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        });
+    }
+    filter.push(libc::sock_filter {
+        code: BPF_JMP_JA,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    });
+    filter.push(libc::sock_filter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k: 0x7fff0000,
+    });
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut _,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            0,
+            &program as *const libc::sock_fprog,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn install_seccomp_deny_filter() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "seccomp filter only implemented for x86_64",
+    ))
+}
+
+#[cfg(unix)]
+fn apply_uid_gid(uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    match (uid, gid) {
+        (Some(uid), Some(gid)) => unsafe {
+            let current_uid = libc::geteuid();
+            let current_gid = libc::getegid();
+            let group_change = current_gid != gid as libc::gid_t;
+            let uid_change = current_uid != uid as libc::uid_t;
+            let groups_ok = !group_change || libc::setgroups(0, std::ptr::null()) == 0;
+            let gid_ok = !group_change || libc::setgid(gid as libc::gid_t) == 0;
+            let uid_ok = !uid_change || libc::setuid(uid as libc::uid_t) == 0;
+            if groups_ok && gid_ok && uid_ok {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        },
+        (None, None) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UID/GID must be paired",
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -872,6 +1023,10 @@ fn apply_sandbox(command: &mut Command, sandbox: &SandboxPolicy) -> Result<(), S
             }
             if limits.network_namespace && libc::unshare(libc::CLONE_NEWNET) == -1 {
                 return Err(io::Error::last_os_error());
+            }
+            apply_uid_gid(limits.run_as_uid, limits.run_as_gid)?;
+            if limits.seccomp_deny_dangerous {
+                install_seccomp_deny_filter()?;
             }
             set_limit(libc::RLIMIT_AS, limits.max_memory_bytes)?;
             set_limit(libc::RLIMIT_CPU, limits.max_cpu_seconds)?;
@@ -1331,6 +1486,33 @@ mod tests {
             apply_sandbox(&mut command, &sandbox)
                 .unwrap_err()
                 .contains("clear_environment")
+        );
+    }
+
+    #[test]
+    fn sandbox_rejects_unpaired_or_root_identity() {
+        let unpaired = SandboxPolicy {
+            run_as_uid: Some(65534),
+            ..SandboxPolicy::default()
+        };
+        assert!(validate_sandbox_policy(&unpaired).is_err());
+        let root = SandboxPolicy {
+            run_as_uid: Some(0),
+            run_as_gid: Some(0),
+            ..SandboxPolicy::default()
+        };
+        assert!(validate_sandbox_policy(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_identity_privilege_path_is_allowed() {
+        assert!(
+            apply_uid_gid(
+                Some(unsafe { libc::geteuid() } as u32),
+                Some(unsafe { libc::getegid() } as u32)
+            )
+            .is_ok()
         );
     }
 

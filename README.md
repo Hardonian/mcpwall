@@ -28,7 +28,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-The release binary is `target/release/mcpwall` (currently v0.8.0).
+The release binary is `target/release/mcpwall` (currently v0.9.0).
 
 ## Configure
 
@@ -134,6 +134,10 @@ max_open_files = 256
 # Linux per-user/thread limit; leave 0 unless you understand host-wide semantics.
 max_processes = 0
 network_namespace = false
+seccomp_deny_dangerous = true
+# Optional identity drop; a different UID/GID requires a privileged launcher.
+# run_as_uid = 65534
+# run_as_gid = 65534
 ```
 
 When enabled, mcpwall:
@@ -146,10 +150,14 @@ When enabled, mcpwall:
 - Enforces a wall-clock timeout and kills the entire child process group
 - Validates the working directory before startup
 - Can request a separate network namespace with `network_namespace = true`; if the host denies `unshare`, startup fails closed
+- Can deny high-risk kernel interfaces with an x86_64 seccomp filter (`ptrace`, mount/namespace changes, module loading, `bpf`, perf events, process-memory access, and related interfaces)
+- Can drop to a configured non-root UID/GID before the child executes
+
+`seccomp_deny_dangerous` is a deny filter, not a complete syscall allowlist. It preserves normal MCP server operation while returning `EPERM` for selected high-risk interfaces. It is currently implemented and verified on Linux x86_64; unsupported architectures fail closed if enabled. Identity changes require the parent process to have the host privilege to perform them; unauthorized changes fail before child startup. The configured UID must never be root.
 
 `max_processes` is deliberately opt-in because Linux applies `RLIMIT_NPROC` to the user’s processes/threads, not only this child. A value that is too low can prevent otherwise-valid subprocesses from starting or affect unrelated same-user workloads.
 
-This is meaningful process hardening, but it is not equivalent to a container or complete kernel sandbox. It does not provide mount isolation, seccomp policy generation, user-ID remapping, or protection from a privileged host attacker.
+This is meaningful process hardening, but it is not equivalent to a container or complete kernel sandbox. It does not provide mount isolation, user-ID remapping by itself, or protection from a privileged host attacker.
 
 ## v0.7 full JSON Schema enforcement
 

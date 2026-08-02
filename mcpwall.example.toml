@@ -1,4 +1,4 @@
-# mcpwall v0.8 policy. One server section is selected with --server.
+# mcpwall v0.9 policy. One server section is selected with --server.
 [server.filesystem]
 command = "/usr/local/bin/mcp-filesystem"
 args = ["/home/scott/projects"]
@@ -32,6 +32,10 @@ audit_path = "/tmp/mcpwall-filesystem.jsonl"
 # max_open_files = 256
 # max_processes = 64
 # network_namespace = false
+# seccomp_deny_dangerous = true
+# Optional identity drop. Requires a privileged launcher for a different UID/GID.
+# run_as_uid = 65534
+# run_as_gid = 65534
 
 [server.filesystem.tool_policies.read_file]
 allowed_arguments = ["path"]
