@@ -1,6 +1,6 @@
 [package]
 name = "mcpwall"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "A local-first policy firewall and audit proxy for MCP stdio servers"
 license = "MIT"
