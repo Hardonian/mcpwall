@@ -135,7 +135,7 @@ struct Config {
 
 fn usage() {
     println!(
-        "mcpwall 1.0.4 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
+        "mcpwall 1.0.5 — local MCP policy firewall\n\nUsage:\n  mcpwall doctor --config FILE --server NAME\n  mcpwall proxy  --config FILE --server NAME\n  mcpwall status --config FILE --server NAME\n  mcpwall inventory --config FILE --server NAME\n  mcpwall approvals --config FILE --server NAME\n  mcpwall approve --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall deny    --config FILE --server NAME --hash HASH REQUEST_ID\n  mcpwall --help\n\nThe proxy speaks newline-delimited JSON-RPC over stdin/stdout. Approval decisions are hash-bound and one-time."
     );
 }
 
@@ -928,7 +928,7 @@ fn status(p: &Policy) -> Result<(), String> {
         *counts.entry(approval.state).or_insert(0usize) += 1;
     }
     let inventory_ready = !p.require_known_tools || inventory_fresh(p);
-    println!("version: 1.0.4");
+    println!("version: 1.0.5");
     println!("command: {}", p.command);
     println!("audit_exists: {}", p.audit_path.exists());
     println!(
