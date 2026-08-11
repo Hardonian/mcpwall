@@ -52,6 +52,10 @@ For interactive approval:
 
 An approval does not authorize modified arguments and cannot be replayed.
 
+## Strict production mode
+
+Set `production_mode = true` for a fail-closed production policy. It requires an enabled sandbox, explicit non-root UID/GID, explicit allowed tools, a positive timeout, non-empty `allowed_roots` for path policies, and owner-controlled private state paths. The state directory must already exist, must not be a symlink, must be owned by the effective user, and must not grant group/other permissions. Compatibility mode remains available for local development but does not enforce these production prerequisites.
+
 ## Lab health checks
 
 ```sh
@@ -113,7 +117,9 @@ Never delete the audit or approval queue during a routine upgrade. Preserve them
 ## Known limits
 
 - Stdio JSON-RPC only; no network transport or TLS.
-- Path checks are lexical and do not resolve symlinks.
+- When `allowed_roots` is configured, path arguments must be absolute. Existing paths are canonicalized before component-aware root containment is checked; lexical fallback is used only for non-existent final paths.
+- This is policy validation, not a race-free filesystem boundary. Use mount hardening or a stronger outer sandbox for untrusted file access.
+- Inventory uses the configured sandbox launcher and a bounded timeout. With `sandbox.timeout_seconds = 0`, inventory uses a 30-second safety timeout.
 - Inventory is a capability snapshot, not JSON Schema authorization.
 - A compromised host, root user, or compromised child process can bypass this user-space boundary.
 - The default release binary is dynamically linked to glibc.
