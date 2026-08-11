@@ -3,3 +3,11 @@
 *.db
 *.jsonl
 .mcpwall/
+__pycache__/
+.env
+node_modules/
+build/
+.pytest_cache/
+.idea/
+.vscode/
+*.pyc
