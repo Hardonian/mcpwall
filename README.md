@@ -147,7 +147,6 @@ drop_capabilities = [21, 22]
 
 The launcher provides process groups, environment isolation, resource limits, wall-clock cleanup, `PR_SET_NO_NEW_PRIVS`, selected x86_64 seccomp denial, optional mount namespace/read-only root hardening, capability bounding-set drops, and optional UID/GID dropping. `RLIMIT_NPROC` is per-user/thread rather than child-only. Mount and capability controls require host privileges such as `CAP_SYS_ADMIN`; if the host denies them, startup fails closed. This is not a complete container, syscall allowlist, user-namespace mapping, or protection from a privileged host attacker.
 
-
 Each tagged release produces:
 
 - Linux x86_64 GNU/glibc binary
