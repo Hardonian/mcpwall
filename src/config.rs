@@ -122,6 +122,35 @@ pub fn default_audit_path() -> PathBuf {
     PathBuf::from("mcpwall-audit.jsonl")
 }
 
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            require_approval: Vec::new(),
+            allowed_roots: Vec::new(),
+            redact_patterns: Vec::new(),
+            max_calls_per_minute: default_calls(),
+            max_request_bytes: default_request_bytes(),
+            max_argument_bytes: default_argument_bytes(),
+            denied_argument_keys: Vec::new(),
+            denied_argument_values: Vec::new(),
+            approval_ttl_seconds: default_approval_ttl(),
+            inventory_max_age_seconds: 0,
+            audit_path: default_audit_path(),
+            inventory_path: None,
+            require_known_tools: false,
+            production_mode: false,
+            dry_run: false,
+            tool_policies: BTreeMap::new(),
+            tool_schemas: BTreeMap::new(),
+            sandbox: SandboxPolicy::default(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {

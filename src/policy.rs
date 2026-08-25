@@ -9,9 +9,6 @@ use std::time::Instant;
 
 /// Normalizes a path, resolving `.` and `..` without requiring the target file to exist.
 pub fn normalized_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -39,7 +36,7 @@ pub fn path_allowed(value: &str, roots: &[String]) -> bool {
         return true;
     }
     let candidate = Path::new(value);
-    if !candidate.is_absolute() {
+    if !candidate.is_absolute() && !candidate.has_root() {
         return false;
     }
     let candidate = normalized_path(candidate);
