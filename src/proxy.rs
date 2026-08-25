@@ -84,43 +84,44 @@ pub fn proxy(p: &Policy) -> Result<(), String> {
 
         // Rate limiting check
         if !rate_limiter.check_and_record(p.max_calls_per_minute) {
-            violation = Some((CODE_RATE_LIMITED, "rate limit exceeded".into(), "rate_limit"));
+            violation = Some((
+                CODE_RATE_LIMITED,
+                "rate limit exceeded".into(),
+                "rate_limit",
+            ));
         }
 
-        if violation.is_none() {
-            if let Some(t) = tool {
-                // JSON Schema validation
-                if let Some(reason) = json_schema_violation(&request, t, &validators) {
-                    violation = Some((CODE_INVALID_PARAMS, reason, "json_schema"));
-                } else if let Some(reason) = tool_schema_violation(&request, t, p) {
-                    violation = Some((CODE_INVALID_PARAMS, reason, "schema"));
-                } else if let Some(reason) = argument_violation(&request, p) {
-                    violation = Some((CODE_INVALID_PARAMS, reason, "argument"));
-                } else if let Err(reason) = is_tool_allowed(p, t) {
-                    violation = Some((CODE_METHOD_NOT_FOUND, reason.to_string(), "tool"));
-                } else {
-                    // Deep path validation across all extracted string arguments
-                    let mut path_denied = false;
-                    let extracted_strings = extract_all_strings(&request);
-                    for value in extracted_strings {
-                        if (value.starts_with('/') || value.contains(":\\") || value.starts_with("\\\\"))
-                            && !path_allowed(value, &p.allowed_roots)
-                        {
-                            path_denied = true;
-                            break;
-                        }
-                    }
-                    if path_denied {
-                        violation = Some((
-                            CODE_INVALID_PARAMS,
-                            "path denied by policy".into(),
-                            "path",
-                        ));
-                    } else if p.require_approval.iter().any(|x| x == t)
-                        && !approval_status(p, &id, &hash, ts)?
+        if let (None, Some(t)) = (&violation, tool) {
+            // JSON Schema validation
+            if let Some(reason) = json_schema_violation(&request, t, &validators) {
+                violation = Some((CODE_INVALID_PARAMS, reason, "json_schema"));
+            } else if let Some(reason) = tool_schema_violation(&request, t, p) {
+                violation = Some((CODE_INVALID_PARAMS, reason, "schema"));
+            } else if let Some(reason) = argument_violation(&request, p) {
+                violation = Some((CODE_INVALID_PARAMS, reason, "argument"));
+            } else if let Err(reason) = is_tool_allowed(p, t) {
+                violation = Some((CODE_METHOD_NOT_FOUND, reason.to_string(), "tool"));
+            } else {
+                // Deep path validation across all extracted string arguments
+                let mut path_denied = false;
+                let extracted_strings = extract_all_strings(&request);
+                for value in extracted_strings {
+                    if (value.starts_with('/')
+                        || value.contains(":\\")
+                        || value.starts_with("\\\\"))
+                        && !path_allowed(value, &p.allowed_roots)
                     {
-                        if p.dry_run {
-                            audit(
+                        path_denied = true;
+                        break;
+                    }
+                }
+                if path_denied {
+                    violation = Some((CODE_INVALID_PARAMS, "path denied by policy".into(), "path"));
+                } else if p.require_approval.iter().any(|x| x == t)
+                    && !approval_status(p, &id, &hash, ts)?
+                {
+                    if p.dry_run {
+                        audit(
                                 &p.audit_path,
                                 &format!(
                                     r#"{{"event":"dry_run_violation","reason":"approval_required","tool":"{t}","id":{id},"request_hash":"{hash}","request":{line}}}"#
@@ -128,15 +129,15 @@ pub fn proxy(p: &Policy) -> Result<(), String> {
                                 &p.redact_patterns,
                             )
                             .map_err(|e| e.to_string())?;
-                        } else {
-                            enqueue_approval(p, &id, &hash, t, ts)?;
-                            let out = error_response(
-                                &id,
-                                CODE_APPROVAL_REQUIRED,
-                                &format!("approval required; request_id={id}; request_hash={hash}"),
-                            );
-                            println!("{out}");
-                            audit(
+                    } else {
+                        enqueue_approval(p, &id, &hash, t, ts)?;
+                        let out = error_response(
+                            &id,
+                            CODE_APPROVAL_REQUIRED,
+                            &format!("approval required; request_id={id}; request_hash={hash}"),
+                        );
+                        println!("{out}");
+                        audit(
                                 &p.audit_path,
                                 &format!(
                                     r#"{{"event":"approval_required","tool":"{t}","id":{id},"request_hash":"{hash}","request":{line}}}"#
@@ -144,8 +145,7 @@ pub fn proxy(p: &Policy) -> Result<(), String> {
                                 &p.redact_patterns,
                             )
                             .map_err(|e| e.to_string())?;
-                            continue;
-                        }
+                        continue;
                     }
                 }
             }
@@ -172,7 +172,8 @@ pub fn proxy(p: &Policy) -> Result<(), String> {
                     &p.audit_path,
                     &format!(
                         r#"{{"event":"deny","reason":"{reason}","tool":{},"id":{id}}}"#,
-                        tool.map(|x| format!("\"{x}\"")).unwrap_or_else(|| "null".into())
+                        tool.map(|x| format!("\"{x}\""))
+                            .unwrap_or_else(|| "null".into())
                     ),
                     &p.redact_patterns,
                 )

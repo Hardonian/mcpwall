@@ -1,8 +1,8 @@
 //! Comprehensive integration and verification test suite for mcpwall.
 
 use mcpwall::approval::{
-    Approval, approval_status, enqueue_approval, mutate_approval, parse_approval,
-    request_hash, serialize_approval,
+    Approval, approval_status, enqueue_approval, mutate_approval, parse_approval, request_hash,
+    serialize_approval,
 };
 use mcpwall::audit::{audit, redact};
 use mcpwall::config::{Config, Policy, SandboxPolicy, ToolPolicy, validate_sandbox_policy};
@@ -78,11 +78,20 @@ fn test_path_traversal_and_root_boundaries() {
 
     // Direct match and descendant matches
     assert!(path_allowed("/home/scott/workspace/file.rs", &roots));
-    assert!(path_allowed("/home/scott/workspace/nested/dir/file.rs", &roots));
+    assert!(path_allowed(
+        "/home/scott/workspace/nested/dir/file.rs",
+        &roots
+    ));
 
     // Traversal attempts
-    assert!(!path_allowed("/home/scott/workspace/../../etc/shadow", &roots));
-    assert!(!path_allowed("/home/scott/workspace_forbidden/file.rs", &roots));
+    assert!(!path_allowed(
+        "/home/scott/workspace/../../etc/shadow",
+        &roots
+    ));
+    assert!(!path_allowed(
+        "/home/scott/workspace_forbidden/file.rs",
+        &roots
+    ));
     assert!(!path_allowed("relative/path/without/root", &roots));
     assert!(!path_allowed("/etc/passwd", &roots));
 }
@@ -193,7 +202,10 @@ fn test_json_schema_validation_engine() {
             }
         }
     });
-    assert_eq!(json_schema_violation(&valid_req, "backup_tool", &validators), None);
+    assert_eq!(
+        json_schema_violation(&valid_req, "backup_tool", &validators),
+        None
+    );
 
     let invalid_req = serde_json::json!({
         "params": {
@@ -357,4 +369,33 @@ fn test_sandbox_validation_constraints() {
         ..SandboxPolicy::default()
     };
     assert!(validate_sandbox_policy(&bad_env).is_err());
+}
+
+#[test]
+fn test_jsonrpc_notification_handling() {
+    let raw = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"protocolVersion":"2024-11-05"}}"#;
+    let req = parse_request(raw, 4096).expect("valid notification");
+    assert!(is_notification(&req));
+    assert_eq!(request_method(&req), "notifications/initialized");
+    assert_eq!(request_id_value(&req), "null");
+}
+
+#[test]
+fn test_deep_secret_value_redaction() {
+    let raw = r#"{"headers":{"authorization":"Bearer sec-token-9988"},"data":{"key":"sensitive"}}"#;
+    let patterns = vec!["sec-token".into(), "key".into()];
+    let redacted = redact(raw.into(), &patterns);
+    assert!(!redacted.contains("sec-token-9988"));
+    assert!(!redacted.contains("sensitive"));
+    assert!(redacted.contains("***REDACTED***"));
+}
+
+#[test]
+fn test_dry_run_policy_defaults() {
+    let p = Policy {
+        dry_run: true,
+        ..Policy::default()
+    };
+    assert!(p.dry_run);
+    assert_eq!(p.max_calls_per_minute, 60);
 }

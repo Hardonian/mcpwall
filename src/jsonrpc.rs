@@ -146,11 +146,8 @@ mod tests {
         assert!(is_notification(&req));
         assert_eq!(request_id_value(&req), "null");
 
-        let req_with_id = parse_request(
-            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
-            1024,
-        )
-        .expect("valid request");
+        let req_with_id = parse_request(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, 1024)
+            .expect("valid request");
         assert!(!is_notification(&req_with_id));
     }
 }
