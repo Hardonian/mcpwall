@@ -31,7 +31,7 @@ Use it when you need a small, inspectable control point. Use a properly configur
 
 ## Features
 
-- Single-object newline-delimited JSON-RPC 2.0 validation
+- Single-object newline-delimited JSON-RPC 2.0 validation and non-blocking notification support
 - Tool allowlists and denylists
 - Per-tool allowed and required argument fields
 - Per-tool JSON type checks
@@ -42,7 +42,8 @@ Use it when you need a small, inspectable control point. Use a properly configur
 - Per-minute rate limits
 - One-time, TTL-bound, SHA-256-bound approvals
 - MCP `tools/list` inventory capture and optional known-tool enforcement
-- Redacted JSONL audit logging with restrictive Unix permissions
+- Redacted JSONL audit logging with restrictive Unix permissions and deep value redaction
+- Dry-run / simulation mode (`dry_run = true`) for non-blocking onboarding and policy tuning
 - Optional Linux sandbox process groups and descendant cleanup
 - Optional Linux x86_64 seccomp deny filter for selected high-risk syscalls
 - Optional Linux mount namespace and read-only root filesystem hardening

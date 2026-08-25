@@ -9,8 +9,8 @@ use mcpwall::config::{Config, Policy, SandboxPolicy, ToolPolicy, validate_sandbo
 use mcpwall::inventory::inventory_tool_names;
 use mcpwall::jsonrpc::{
     CODE_APPROVAL_REQUIRED, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND,
-    CODE_RATE_LIMITED, error_response, extract_all_strings, parse_request, request_id_value,
-    request_method, request_tool,
+    CODE_RATE_LIMITED, error_response, extract_all_strings, is_notification, parse_request,
+    request_id_value, request_method, request_tool,
 };
 use mcpwall::policy::{
     RateLimiter, argument_violation, is_tool_allowed, path_allowed, tool_schema_violation,
