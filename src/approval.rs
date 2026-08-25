@@ -44,10 +44,25 @@ fn escape_field(value: &str) -> String {
 }
 
 fn unescape_field(value: &str) -> String {
-    value
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\\", "\\")
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn serialize_approval(a: &Approval) -> String {
