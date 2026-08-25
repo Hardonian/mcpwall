@@ -54,6 +54,11 @@ pub fn request_id_value(request: &Value) -> String {
         .unwrap_or_else(|| "null".into())
 }
 
+/// Returns true if the JSON-RPC request is a Notification (lacks an `id` field).
+pub fn is_notification(request: &Value) -> bool {
+    request.get("id").is_none()
+}
+
 /// Recursively extracts all string values from a JSON AST.
 ///
 /// This provides reliable string extraction that correctly resolves Unicode escapes
@@ -129,5 +134,23 @@ mod tests {
         let res = error_response("1", CODE_INVALID_PARAMS, "argument \"path\" is invalid");
         assert!(res.contains(r#""code":-32602"#));
         assert!(res.contains(r#""message":"argument \"path\" is invalid""#));
+    }
+
+    #[test]
+    fn detects_notifications_without_id() {
+        let req = parse_request(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            1024,
+        )
+        .expect("valid notification");
+        assert!(is_notification(&req));
+        assert_eq!(request_id_value(&req), "null");
+
+        let req_with_id = parse_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            1024,
+        )
+        .expect("valid request");
+        assert!(!is_notification(&req_with_id));
     }
 }

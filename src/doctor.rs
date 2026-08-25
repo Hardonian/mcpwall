@@ -41,6 +41,11 @@ pub fn status(p: &Policy) -> Result<(), String> {
         "limits: request_bytes={} argument_bytes={} calls_per_minute={}",
         p.max_request_bytes, p.max_argument_bytes, p.max_calls_per_minute
     );
+    if p.dry_run {
+        println!("mode: dry-run (violations audited but not blocked)");
+    } else {
+        println!("mode: enforcing");
+    }
     println!("status: healthy");
     Ok(())
 }
@@ -109,6 +114,9 @@ pub fn doctor(p: &Policy) -> Result<(), String> {
         println!("inventory: {}", path.display());
     }
     println!("audit: {}", p.audit_path.display());
+    if p.dry_run {
+        println!("dry_run: enabled (audit-only mode)");
+    }
     println!("status: healthy");
     Ok(())
 }

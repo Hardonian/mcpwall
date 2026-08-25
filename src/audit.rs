@@ -12,9 +12,11 @@ pub fn redact_json_value(value: &mut Value, patterns: &[String]) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
-                let key_matches = patterns
-                    .iter()
-                    .any(|p| key.eq_ignore_ascii_case(p) || key.contains(p));
+                let key_matches = patterns.iter().any(|p| {
+                    !p.is_empty()
+                        && (key.eq_ignore_ascii_case(p)
+                            || key.to_ascii_lowercase().contains(&p.to_ascii_lowercase()))
+                });
                 if key_matches {
                     *child = Value::String("***REDACTED***".into());
                 } else {
@@ -25,6 +27,15 @@ pub fn redact_json_value(value: &mut Value, patterns: &[String]) {
         Value::Array(items) => {
             for item in items.iter_mut() {
                 redact_json_value(item, patterns);
+            }
+        }
+        Value::String(s) => {
+            let lower = s.to_ascii_lowercase();
+            if patterns
+                .iter()
+                .any(|p| !p.is_empty() && lower.contains(&p.to_ascii_lowercase()))
+            {
+                *s = "***REDACTED***".into();
             }
         }
         _ => {}
@@ -121,5 +132,15 @@ mod tests {
         let redacted = redact(raw.into(), &patterns);
         assert!(!redacted.contains("secret"));
         assert!(redacted.contains("***REDACTED***"));
+    }
+
+    #[test]
+    fn redacts_sensitive_values_in_strings() {
+        let raw = r#"{"payload":"Authorization: Bearer my-secret-token-123","normal":"ok"}"#;
+        let patterns = vec!["my-secret-token".into()];
+        let redacted = redact(raw.into(), &patterns);
+        assert!(!redacted.contains("my-secret-token"));
+        assert!(redacted.contains("***REDACTED***"));
+        assert!(redacted.contains("normal"));
     }
 }

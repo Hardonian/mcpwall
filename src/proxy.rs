@@ -5,8 +5,8 @@ use crate::audit::audit;
 use crate::config::Policy;
 use crate::jsonrpc::{
     CODE_APPROVAL_REQUIRED, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND,
-    CODE_RATE_LIMITED, error_response, extract_all_strings, parse_request, request_id_value,
-    request_method, request_tool,
+    CODE_RATE_LIMITED, error_response, extract_all_strings, is_notification, parse_request,
+    request_id_value, request_method, request_tool,
 };
 use crate::policy::{
     RateLimiter, argument_violation, is_tool_allowed, path_allowed, tool_schema_violation,
@@ -69,6 +69,7 @@ pub fn proxy(p: &Policy) -> Result<(), String> {
             }
         };
 
+        let is_notif = is_notification(&request);
         let method = request_method(&request);
         let tool = if method == "tools/call" {
             request_tool(&request)
@@ -79,108 +80,99 @@ pub fn proxy(p: &Policy) -> Result<(), String> {
         let hash = request_hash(&line);
         let ts = now_seconds();
 
+        let mut violation: Option<(i64, String, &str)> = None;
+
         // Rate limiting check
         if !rate_limiter.check_and_record(p.max_calls_per_minute) {
-            let out = error_response(&id, CODE_RATE_LIMITED, "rate limit exceeded");
-            println!("{out}");
-            audit(
-                &p.audit_path,
-                &format!(r#"{{"event":"deny","reason":"rate_limit","id":{id}}}"#),
-                &p.redact_patterns,
-            )
-            .map_err(|e| e.to_string())?;
-            continue;
+            violation = Some((CODE_RATE_LIMITED, "rate limit exceeded".into(), "rate_limit"));
         }
 
-        if let Some(t) = tool {
-            // JSON Schema validation
-            if let Some(reason) = json_schema_violation(&request, t, &validators) {
-                let out = error_response(&id, CODE_INVALID_PARAMS, &reason);
-                println!("{out}");
-                audit(
-                    &p.audit_path,
-                    &format!(r#"{{"event":"deny","reason":"json_schema","tool":"{t}","id":{id}}}"#),
-                    &p.redact_patterns,
-                )
-                .map_err(|e| e.to_string())?;
-                continue;
-            }
-
-            // Granular tool schema policy
-            if let Some(reason) = tool_schema_violation(&request, t, p) {
-                let out = error_response(&id, CODE_INVALID_PARAMS, &reason);
-                println!("{out}");
-                audit(
-                    &p.audit_path,
-                    &format!(r#"{{"event":"deny","reason":"schema","tool":"{t}","id":{id}}}"#),
-                    &p.redact_patterns,
-                )
-                .map_err(|e| e.to_string())?;
-                continue;
-            }
-
-            // General argument content checks
-            if let Some(reason) = argument_violation(&request, p) {
-                let out = error_response(&id, CODE_INVALID_PARAMS, &reason);
-                println!("{out}");
-                audit(
-                    &p.audit_path,
-                    &format!(r#"{{"event":"deny","reason":"argument","tool":"{t}","id":{id}}}"#),
-                    &p.redact_patterns,
-                )
-                .map_err(|e| e.to_string())?;
-                continue;
-            }
-
-            // Tool allow/deny & inventory checks
-            if let Err(reason) = is_tool_allowed(p, t) {
-                let out = error_response(&id, CODE_METHOD_NOT_FOUND, reason);
-                println!("{out}");
-                audit(
-                    &p.audit_path,
-                    &format!(r#"{{"event":"deny","reason":"tool","tool":"{t}","id":{id}}}"#),
-                    &p.redact_patterns,
-                )
-                .map_err(|e| e.to_string())?;
-                continue;
-            }
-
-            // Deep path validation across all extracted string arguments
-            let mut path_denied = false;
-            let extracted_strings = extract_all_strings(&request);
-            for value in extracted_strings {
-                if (value.starts_with('/') || value.contains(":\\") || value.starts_with("\\\\"))
-                    && !path_allowed(value, &p.allowed_roots)
-                {
-                    path_denied = true;
-                    break;
+        if violation.is_none() {
+            if let Some(t) = tool {
+                // JSON Schema validation
+                if let Some(reason) = json_schema_violation(&request, t, &validators) {
+                    violation = Some((CODE_INVALID_PARAMS, reason, "json_schema"));
+                } else if let Some(reason) = tool_schema_violation(&request, t, p) {
+                    violation = Some((CODE_INVALID_PARAMS, reason, "schema"));
+                } else if let Some(reason) = argument_violation(&request, p) {
+                    violation = Some((CODE_INVALID_PARAMS, reason, "argument"));
+                } else if let Err(reason) = is_tool_allowed(p, t) {
+                    violation = Some((CODE_METHOD_NOT_FOUND, reason.to_string(), "tool"));
+                } else {
+                    // Deep path validation across all extracted string arguments
+                    let mut path_denied = false;
+                    let extracted_strings = extract_all_strings(&request);
+                    for value in extracted_strings {
+                        if (value.starts_with('/') || value.contains(":\\") || value.starts_with("\\\\"))
+                            && !path_allowed(value, &p.allowed_roots)
+                        {
+                            path_denied = true;
+                            break;
+                        }
+                    }
+                    if path_denied {
+                        violation = Some((
+                            CODE_INVALID_PARAMS,
+                            "path denied by policy".into(),
+                            "path",
+                        ));
+                    } else if p.require_approval.iter().any(|x| x == t)
+                        && !approval_status(p, &id, &hash, ts)?
+                    {
+                        if p.dry_run {
+                            audit(
+                                &p.audit_path,
+                                &format!(
+                                    r#"{{"event":"dry_run_violation","reason":"approval_required","tool":"{t}","id":{id},"request_hash":"{hash}","request":{line}}}"#
+                                ),
+                                &p.redact_patterns,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        } else {
+                            enqueue_approval(p, &id, &hash, t, ts)?;
+                            let out = error_response(
+                                &id,
+                                CODE_APPROVAL_REQUIRED,
+                                &format!("approval required; request_id={id}; request_hash={hash}"),
+                            );
+                            println!("{out}");
+                            audit(
+                                &p.audit_path,
+                                &format!(
+                                    r#"{{"event":"approval_required","tool":"{t}","id":{id},"request_hash":"{hash}","request":{line}}}"#
+                                ),
+                                &p.redact_patterns,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            continue;
+                        }
+                    }
                 }
             }
-            if path_denied {
-                let out = error_response(&id, CODE_INVALID_PARAMS, "path denied by policy");
-                println!("{out}");
-                audit(
-                    &p.audit_path,
-                    &format!(r#"{{"event":"deny","reason":"path","tool":"{t}","id":{id}}}"#),
-                    &p.redact_patterns,
-                )
-                .map_err(|e| e.to_string())?;
-                continue;
-            }
+        }
 
-            // Approval check
-            if p.require_approval.iter().any(|x| x == t) && !approval_status(p, &id, &hash, ts)? {
-                enqueue_approval(p, &id, &hash, t, ts)?;
-                let out = error_response(
-                    &id,
-                    CODE_APPROVAL_REQUIRED,
-                    &format!("approval required; request_id={id}; request_hash={hash}"),
-                );
-                println!("{out}");
+        if let Some((code, message, reason)) = violation {
+            if p.dry_run {
                 audit(
                     &p.audit_path,
                     &format!(
-                        r#"{{"event":"approval_required","tool":"{t}","id":{id},"request_hash":"{hash}","request":{line}}}"#
+                        r#"{{"event":"dry_run_violation","reason":"{reason}","tool":{},"id":{id},"message":"{}","request":{line}}}"#,
+                        tool.map(|x| format!("\"{x}\"")).unwrap_or_else(|| "null".into()),
+                        message.replace('"', "'")
+                    ),
+                    &p.redact_patterns,
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                if !is_notif {
+                    let out = error_response(&id, code, &message);
+                    println!("{out}");
+                }
+                audit(
+                    &p.audit_path,
+                    &format!(
+                        r#"{{"event":"deny","reason":"{reason}","tool":{},"id":{id}}}"#,
+                        tool.map(|x| format!("\"{x}\"")).unwrap_or_else(|| "null".into())
                     ),
                     &p.redact_patterns,
                 )
@@ -195,6 +187,19 @@ pub fn proxy(p: &Policy) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         child_in.write_all(b"\n").map_err(|e| e.to_string())?;
         child_in.flush().map_err(|e| e.to_string())?;
+
+        if is_notif {
+            audit(
+                &p.audit_path,
+                &format!(
+                    r#"{{"event":"forward_notification","method":"{method}","tool":{},"request":{line}}}"#,
+                    tool.map(|x| format!("\"{x}\"")).unwrap_or_else(|| "null".into())
+                ),
+                &p.redact_patterns,
+            )
+            .map_err(|e| e.to_string())?;
+            continue;
+        }
 
         let mut response = String::new();
         child_out

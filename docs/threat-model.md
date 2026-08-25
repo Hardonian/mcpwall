@@ -11,16 +11,15 @@ Protected assets:
 
 ## Current scope and limitations
 
-The optional Linux sandbox now provides process groups, environment isolation, resource limits, wall-clock cleanup, `PR_SET_NO_NEW_PRIVS`, a selected x86_64 seccomp deny filter, and optional UID/GID dropping. These controls are user-space hardening, not a complete kernel sandbox.
+The optional Linux sandbox provides process groups, environment isolation, resource limits, wall-clock cleanup, `PR_SET_NO_NEW_PRIVS`, selected x86_64 seccomp denial, optional mount namespace and read-only root filesystem isolation, capability bounding-set drops, and optional UID/GID execution identity dropping.
 
 Still out of scope:
 
-- Mount namespace or read-only root filesystem isolation
 - Automatic user namespace mapping
-- Complete syscall allowlisting
+- Complete syscall allowlisting (seccomp is a targeted deny filter for high-risk interfaces)
 - Protection against root, kernel compromise, or malicious same-user processes
 - Compromised MCP server binaries that exploit an unblocked kernel/application path
-- TLS/network MCP transport
+- TLS/network MCP transport (stdio only)
 
 Required deployment posture:
 
