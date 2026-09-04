@@ -1,5 +1,9 @@
 # mcpwall
 
+<!-- BEGIN: REPO HERO -->
+![mcpwall — hero generated locally on the GPU stack](assets/repo-hero.png)
+<!-- END: REPO HERO -->
+
 [![CI](https://github.com/Hardonian/mcpwall/actions/workflows/ci.yml/badge.svg)](https://github.com/Hardonian/mcpwall/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/Hardonian/mcpwall?display_name=tag&sort=semver)](https://github.com/Hardonian/mcpwall/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
